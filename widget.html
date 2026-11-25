@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+*{box-sizing:border-box}
+body{margin:0;padding:12px;font:400 14px system-ui;color:var(--tg-theme-text-color,#f2f2f7)}
+.c{background:rgba(127,127,131,.18);backdrop-filter:blur(22px);-webkit-backdrop-filter:blur(22px);border:1px solid rgba(255,255,255,.18);border-radius:26px;padding:13px 14px;box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}
+.r{display:flex;align-items:center;gap:8px}
+.s{font-size:11px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;color:var(--tg-theme-hint-color,#98989f)}
+.tag{margin-left:auto;font-size:11px;padding:3px 10px;border-radius:999px;background:rgba(127,127,131,.22);border:1px solid rgba(255,255,255,.12)}
+h1{margin:9px 0 3px;font-size:16px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.m{font-size:11px;color:var(--tg-theme-hint-color,#98989f);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.track{height:6px;margin:11px 0 3px;border-radius:999px;background:rgba(127,127,131,.28);overflow:hidden}
+.fill{height:100%;width:0;border-radius:999px;background:var(--tg-theme-button-color,#0a84ff);transition:width .4s ease}
+.e{font-size:11px;color:#ff7b72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row{display:flex;gap:7px;margin-top:10px}
+button{flex:1;font:600 12px system-ui;color:inherit;background:rgba(127,127,131,.2);border:1px solid rgba(255,255,255,.14);border-radius:999px;padding:8px 3px;cursor:pointer}
+button.on{background:var(--tg-theme-button-color,#0a84ff);color:var(--tg-theme-button-text-color,#fff);border-color:transparent}
+button.off{color:var(--tg-theme-hint-color,#98989f)}
+</style></head><body><div class="c" id="c">
+<div class="r"><span class="s" id="src">DOWNLOADER</span><span class="tag" id="tag">готов</span></div>
+<h1 id="ttl">Отправь ссылку</h1>
+<div class="m" id="meta">YouTube · TikTok · Instagram · X · VK · и другие</div>
+<div class="track" id="tr" style="display:none"><div class="fill" id="fill"></div></div>
+<div class="e" id="err" style="display:none"></div>
+<div class="row" id="q" style="display:none"><button id="b0" data-c="q:360">360p</button><button id="b1" data-c="q:720">720p</button><button id="b2" data-c="q:1080">1080p</button><button id="b3" data-c="q:a">Аудио</button></div>
+<div class="row" id="k" style="display:none"><button id="bp" data-c="p">‹</button><button id="num" style="flex:2"></button><button id="bn" data-c="n">›</button></div>
+<div class="row" id="a"><button id="br" data-c="r">Ещё раз</button><button id="bx" data-c="x">Отмена</button><button id="bo" data-c="o">Источник</button></div>
+</div><script>
+var W=window.TelegramWidget,$=function(i){return document.getElementById(i)},S={},busy=0,Q=['360','720','1080','a'];
+function show(i,v,d){$(i).style.display=v?(d||'flex'):'none'}
+function label(p){return {idle:'готов',queued:'в очереди',meta:'разбираю',down:'скачивание',encode:'обработка',up:'отправка',done:'готово',carousel:'карусель',error:'ошибка'}[p]||p}
+function draw(){
+ try{S=JSON.parse(W.chatData)||{}}catch(e){S={}}
+ var ph=S.ph||'idle',n=S.n||0,i=S.i||0,p=S.p||0,q=String(S.q||'720'),t=S.t||'',m=S.m||'',e=S.e||'';
+ $('src').textContent=S.s||'DOWNLOADER';
+ $('tag').textContent=label(ph)+(ph==='down'?' '+p+'%':'');
+ $('ttl').textContent=ph==='idle'?'Отправь ссылку':(t||'Без названия');
+ $('meta').textContent=m||'YouTube · TikTok · Instagram · и другие';
+ show('tr',ph==='queued'||ph==='meta'||ph==='down'||ph==='encode'||ph==='up','block');
+ $('fill').style.width=p+'%';
+ show('err',!!e,'block');$('err').textContent=e;
+ var done=ph==='done'||ph==='carousel';
+ show('q',done);
+ for(var j=0;j<4;j++){$('b'+j).className=(q===Q[j]||(j===3&&q==='a'))?'on':''}
+ show('k',n>1);$('num').textContent=n>1?(i+1+' / '+n):'';
+ $('bx').className=(ph==='queued'||ph==='meta'||ph==='down'||ph==='encode'||ph==='up')?'':'off';
+ show('bo',!!S.u);
+}
+function tap(c){return function(){
+ if(busy)return;
+ if(c==='o'){var u=S.u||'';if(u){try{W.openLink(u)}catch(e){}}return}
+ busy=1;
+ W.request(c).then(function(){busy=0},function(x){busy=0;show('err',1,'block');$('err').textContent=x.code||'Ошибка'});
+}}
+var B=[['b0','q:360'],['b1','q:720'],['b2','q:1080'],['b3','q:a'],['bp','p'],['bn','n'],['br','r'],['bx','x'],['bo','o']];
+for(var z=0;z<B.length;z++){var el=$(B[z][0]);if(el)el.onclick=tap(B[z][1])}
+W.onEvent('chatDataChanged',draw);
+draw();
+</script></body></html>
