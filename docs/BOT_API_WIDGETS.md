@@ -160,6 +160,21 @@ await bot.set_webhook(url=..., allowed_updates=[
 и логирование `SIGTERM`. `SystemExit` из потока гасится в `run_job`, иначе asyncio.Task
 пробрасывает его в event loop и завершает процесс.
 
+### Бюджет памяти на 256 МБ стенде
+
+Прямые замеры `ru_maxrss` (Python 3.11, aiogram 3.34): `import aiogram` = 163 МБ,
+`import yt_dlp` сверху = +43 МБ (в `bot` реально +13 МБ из-за пересечения),
+дочерний `python -m yt_dlp -J` = 37–49 МБ, `ffmpeg` при пережатии = ~100+ МБ.
+Сумма трёх процессов превышает 256 МБ → OOM-killer сразу после старта разведки.
+
+Лечение: `MEMORY_PROFILE=auto|low|normal` с авто-детектом по `cgroup memory.max`
+(порог 384 МБ). LOW: ленивый импорт yt-dlp (версия через `importlib.metadata`, без
+загрузки 1751 экстрактора в родителя), 1 воркер, жёсткий `ulimit -v` для ребёнка через
+`/bin/sh -c 'ulimit -v N; exec "$@"'` (`preexec_fn` в многопоточном процессе небезопасен),
+отказ от `bv+ba` merge и ffmpeg-пережатия, `--concurrent-fragments 1`, потолки на
+`MAX_ORIGINAL_MB`/`MAX_SLIDES`/очередь, которые нельзя превысить из `.env`.
+`--doctor` и `/diag` показывают лимит, профиль, `VmRSS` и `maxRSS`.
+
 ### Диагностика «видео не качаются»
 
 `--doctor` / `/diag` показывают Python, aiogram, yt-dlp, `ffmpeg`/`ffprobe`/`gallery-dl`,

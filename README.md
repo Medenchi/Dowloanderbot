@@ -190,6 +190,50 @@ Dailymotion, Vimeo, Threads, Snapchat, Coub, Rumble, Yandex — плюс **вс�
 Новые строки лога: `нормализовал ссылку`, `разведка: subprocess старт/rc/ТАЙМАУТ`,
 `дубль ссылки, пропускаю`, `пропускаю устаревший update`, `получен сигнал SIGTERM`.
 
+## Стенд на 256 МБ ОЗУ
+
+Замеры на Python 3.11 + aiogram 3.34 (RSS после импорта):
+
+| Процесс | RSS |
+|---|---|
+| `import aiogram` | **163 МБ** |
+| `import bot` (раньше, с top-level `yt_dlp`) | 177 МБ |
+| `import bot` сейчас | **163 МБ** (yt-dlp грузится лениво) |
+| дочерний `python -m yt_dlp -J` | 37–49 МБ, на реальном YouTube больше |
+| `ffmpeg` при пережатии | ~100+ МБ |
+
+То есть родитель + ребёнок + ffmpeg на 256 МБ не влезают — OOM-killer убивает контейнер
+сразу после `разведка: subprocess старт`. Это не «большой файл», а сумма трёх процессов.
+
+**`MEMORY_PROFILE=auto`** (по умолчанию) читает `cgroup memory.max` → `MemTotal` и при лимите
+<384 МБ включает **LOW**:
+
+* `MAX_PARALLEL=1`, очередь ≤8, `MAX_ORIGINAL_MB≤150`, `MAX_SLIDES≤10`, `MAX_IMAGE_MB` тот же;
+* yt-dlp **не импортируется в родителе** (версия берётся из `importlib.metadata`), экономим ~13 МБ;
+* дочерний `yt-dlp` получает жёсткий `ulimit -v 128 МБ` через shell (`preexec_fn` не используем —
+  он небезопасен в многопоточном asyncio). При превышении падает ребёнок, а не бот;
+* CLI разведки добавляет `--concurrent-fragments 1 --extractor-retries 0`;
+* **пережатие ffmpeg и `bv+ba` merge отключены**: только прогрессивный формат, файлы >48 МБ
+  уходят кнопкой «Открыть источник»; `ffprobe` в этом режиме не вызывается;
+* `gallery-dl` и лишние коннекты отключены (`TCPConnector(limit=4)`, 2 потока на карусель).
+
+Явные значения из `.env` в LOW **не могут превысить** потолки (иначе скопированный
+`.env.example` с `MAX_PARALLEL=2` снова уронил бы стенд). `MEMORY_PROFILE=low` включает режим
+принудительно, `normal` — запрещает. `YTDLP_MAX_AS_MB` переопределяет лимит ребёнка.
+
+Проверка: `python bot.py --doctor` печатает `память: лимит=… · профиль=LOW · RSS=… ·
+yt-dlp ulimit=…` и строку `⚠ LOW-MEMORY`, `/diag` добавляет `VmRSS`/`maxRSS`/число потоков.
+В логе старта — `LOW-MEMORY (лимит N МБ): parallel=1, ffmpeg-пережатие отключено…`.
+
+Если хостинг не отдаёт `/sys/fs/cgroup/memory.max`, `--doctor` честно пишет, что лимит взят
+из `MemTotal` хоста (может быть 4 ГБ при реальных 256 МБ) — тогда задай
+`MEMORY_PROFILE=low` в `.env` вручную.
+
+> Честно: 163 МБ — это сам aiogram + pydantic + aiohttp. Меньше без смены фреймворка
+> (прямой HTTP к Bot API) не сделать. На 128 МБ этот стек не влезет в принципе; на 256 МБ
+> LOW оставляет ~90 МБ запаса. Если хост позволяет — 512 МБ и `MEMORY_PROFILE=normal`
+> вернут пережатие и параллелизм.
+
 ## Ограничения платформы (не баги, а Bot API 10.4)
 
 * По документам виджеты в проде — **только приватные чаты с ботом**, всегда `protect_content`,
@@ -215,4 +259,5 @@ Dailymotion, Vimeo, Threads, Snapchat, Coub, Rumble, Yandex — плюс **вс�
 `MAX_QUEUE`, `MAX_UPLOAD_MB`, `MAX_ORIGINAL_MB`, `MAX_SLIDES`, `COOKIES_FILE`, `HTTPS_PROXY`,
 `USE_GALLERY_DL`, `TELEGRAM_WIDGETS`, `WIDGET_RETRY_MIN`, `TELEGRAM_TEST_SERVER`,
 `YTDLP_EXTRACTOR_ARGS`, `YTDLP_ISOLATE_INSPECT`, `DROP_PENDING_UPDATES`,
-`FAULTHANDLER_INTERVAL`, `YTDLP_CLI_EXTRA`, `DB_PATH`, `TMP_DIR`.
+`FAULTHANDLER_INTERVAL`, `YTDLP_CLI_EXTRA`, `MEMORY_PROFILE`, `YTDLP_MAX_AS_MB`,
+`DB_PATH`, `TMP_DIR`.

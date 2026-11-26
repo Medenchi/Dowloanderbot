@@ -7,6 +7,7 @@ import struct
 import sys
 import time
 import zlib
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -14,6 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import bot
+import yt_dlp
 from aiogram.types import Chat, Message, PhotoSize
 
 
@@ -194,10 +196,11 @@ def test_ydl_opts_cap(tmp_path, cfg):
 
 
 def test_ydl_opts_merge_gated_on_ffmpeg(cfg, monkeypatch):
+    c = replace(cfg, low_memory=False)   # не зависит от объёма машины в CI
     monkeypatch.setattr(bot.shutil, "which", lambda name: None)
-    assert "merge_output_format" not in bot.ydl_opts(cfg, "720", download=False)
+    assert "merge_output_format" not in bot.ydl_opts(c, "720", download=False)
     monkeypatch.setattr(bot.shutil, "which", lambda name: "/usr/bin/" + name)
-    assert bot.ydl_opts(cfg, "720", download=False)["merge_output_format"] == "mp4"
+    assert bot.ydl_opts(c, "720", download=False)["merge_output_format"] == "mp4"
 
 
 def test_classify_path(tmp_path):
@@ -243,7 +246,7 @@ def test_inspect_media_photo_carousel(monkeypatch, cfg):
                 {"thumbnail": "https://cdn.instagram.com/3.jpg", "formats": []},
             ]}
 
-    monkeypatch.setattr(bot.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
     info = bot.inspect_media("https://instagram.com/p/x/", "720", cfg)
     assert info["kind"] == "images"
     assert len(info["images"]) == 3
@@ -602,7 +605,7 @@ def test_download_media_prefers_merged_mp4(tmp_path, cfg, monkeypatch):
                     "requested_downloads": [{"filepath": str(src)}],
                     "duration": 12, "width": 640, "height": 360}
 
-    monkeypatch.setattr(bot.yt_dlp, "YoutubeDL", FakeYDL)
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", FakeYDL)
     c = bot.Config.from_env()
     object.__setattr__(c, "tmp_dir", tmp_path / "dl")
     path, dest, info = bot.download_media("https://example.com/v", "720", c,
@@ -903,3 +906,124 @@ def test_environment_lines_show_isolation(cfg):
     text = " ".join(bot.environment_lines(cfg))
     assert "subprocess" in text
     assert "drop_pending_updates" in text
+
+
+# --- 256 МБ стенд ---------------------------------------------------------
+
+def test_lazy_import_does_not_load_ytdlp():
+    """Родитель не должен тащить 1751 экстрактор: экономим ~13 МБ RSS."""
+    import subprocess
+    code = ("from pydantic import FailFast; "
+            "FailFast.__hash__ = lambda s: hash(s.fail_fast); "
+            "import bot, sys; print('yt_dlp' in sys.modules)")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                       text=True, timeout=90,
+                       cwd=str(Path(__file__).resolve().parents[1]))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "False"
+    assert bot.ytdlp_version().count(".") >= 2
+
+
+def test_detect_memory_limit_from_cgroup(monkeypatch):
+    real = Path.read_text
+
+    def fake(self, *a, **kw):
+        if str(self) == "/sys/fs/cgroup/memory.max":
+            return "268435456\n"          # 256 МБ
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", fake)
+    assert bot.detect_memory_limit_bytes() == 256 * 1024 * 1024
+
+
+def test_auto_low_memory_on_small_limit(monkeypatch):
+    monkeypatch.delenv("MEMORY_PROFILE", raising=False)
+    monkeypatch.setattr(bot, "detect_memory_limit_bytes", lambda: 256 * 1024 * 1024)
+    c = bot.Config.from_env()
+    assert c.low_memory is True and c.memory_profile == "auto"
+    assert c.max_parallel == 1 and c.max_queue == 8
+    assert c.max_original_mb == 150 and c.max_slides == 10
+    assert c.ytdlp_max_as_mb == 128
+
+
+def test_memory_profile_low_forced(monkeypatch):
+    monkeypatch.setenv("MEMORY_PROFILE", "low")
+    monkeypatch.setattr(bot, "detect_memory_limit_bytes", lambda: None)
+    c = bot.Config.from_env()
+    assert c.low_memory is True and c.ytdlp_max_as_mb == 128
+
+
+def test_memory_profile_normal_ignores_small_limit(monkeypatch):
+    monkeypatch.setenv("MEMORY_PROFILE", "normal")
+    monkeypatch.setattr(bot, "detect_memory_limit_bytes", lambda: 256 * 1024 * 1024)
+    c = bot.Config.from_env()
+    assert c.low_memory is False and c.ytdlp_max_as_mb == 0
+
+
+def test_wrap_memory_limit(cfg):
+    plain = replace(cfg, ytdlp_max_as_mb=0)
+    assert bot.wrap_memory_limit(["echo", "ok"], plain) == ["echo", "ok"]
+    limited = replace(cfg, ytdlp_max_as_mb=128)
+    cmd = [sys.executable, "-c", "pass"]
+    w = bot.wrap_memory_limit(cmd, limited)
+    assert w[0] == "/bin/sh" and "ulimit -v 131072" in w[2] and 'exec "$@"' in w[2]
+    assert w[3] == "sh" and w[4:] == cmd
+
+
+def test_ydl_cli_cmd_low_memory_flags(cfg):
+    low = replace(cfg, low_memory=True)
+    cmd = bot.ydl_cli_cmd("https://youtu.be/x", low)
+    assert "--concurrent-fragments" in cmd and "--extractor-retries" in cmd
+
+
+def test_ydl_opts_low_memory_no_merge(cfg, tmp_path, monkeypatch):
+    low = replace(cfg, low_memory=True)
+    monkeypatch.setattr(bot.shutil, "which", lambda name: "/usr/bin/" + name)
+    o = bot.ydl_opts(low, "720", download=True, dest=tmp_path)
+    assert "merge_output_format" not in o
+    assert "+" not in o["format"]                    # только прогрессив, без ffmpeg merge
+    assert o["concurrent_fragment_downloads"] == 1
+
+
+def test_service_low_memory_single_worker(tmp_path, cfg):
+    svc, fake = fresh_service(tmp_path)
+    low = replace(svc.cfg, low_memory=True)
+    svc2 = bot.Service(low, fake, bot.Store(tmp_path / "low.sqlite3"),
+                       bot.load_widget_html(), tmp_path / "p.png")
+    assert svc2.sem._value == 1
+    svc2.store.close()
+    svc.store.close()
+
+
+def test_deliver_media_low_memory_never_calls_transcode(tmp_path, cfg, monkeypatch):
+    async def run():
+        svc, s, fake = make_service(tmp_path, cfg)
+        svc.cfg = replace(svc.cfg, low_memory=True)
+        monkeypatch.setattr(bot.shutil, "which", lambda name: "/usr/bin/" + name)
+
+        def must_not_run(*a, **kw):
+            raise AssertionError("в low-memory пережатие запрещено")
+
+        monkeypatch.setattr(bot, "transcode", must_not_run)
+        s.url = "https://www.youtube.com/watch?v=abc"
+        dest = svc.cfg.tmp_dir / "m"
+        dest.mkdir(parents=True, exist_ok=True)
+        p = dest / "clip.mp4"
+        with p.open("wb") as f:
+            f.truncate(49 * 1024 * 1024)       # 49 МБ: <=50, отдаём без пережатия
+        await bot.deliver_media(svc, s, p, dest, "720", {})
+        assert fake.media_calls, "медиа должно уйти в чат"
+        assert s.state.get("ph") != "error"
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_friendly_error_oom():
+    assert "Мало памяти" in bot.friendly_error(Exception("MemoryError"))
+    assert "Мало памяти" in bot.friendly_error(Exception("Cannot allocate memory"))
+
+
+def test_environment_lines_show_memory(cfg):
+    text = " ".join(bot.environment_lines(cfg))
+    assert "память:" in text and "профиль=" in text and "RSS=" in text
