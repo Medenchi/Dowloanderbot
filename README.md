@@ -41,9 +41,13 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 apt install ffmpeg            # либо brew install ffmpeg — для слияния и пережатия >48 МБ
 cp .env.example .env          # вписать BOT_TOKEN
-.venv/bin/python bot.py --check   # проверка без токена: бюджет виджета, версии, ffmpeg
+.venv/bin/python bot.py --doctor  # без токена: версии, ffmpeg/ffprobe, DNS до площадок, режим API
+.venv/bin/python bot.py --check   # бюджет виджета
 .venv/bin/python bot.py
 ```
+
+В чате: `/diag` — тот же отчёт плюс `getMe`, очередь, число сессий и свободное место.
+Бот молчит, пока не попросили.
 
 `MODE=polling` по умолчанию. Для `MODE=webhook` задать `WEBHOOK_URL`, `WEBHOOK_SECRET`,
 `WEBHOOK_HOST=0.0.0.0`, `WEBHOOK_PORT`; `allowed_updates` уже включает `widget_query` и
@@ -115,10 +119,55 @@ Dailymotion, Vimeo, Threads, Snapchat, Coub, Rumble, Yandex — плюс **вс�
 * Один запрос `request()` в полёте на виджете + `busy`-флаг в JS = не ловим `RATE_LIMITED`
   (лимит Telegram: 5 запросов / 5 с на пользователя).
 
+## Если виджет не отправляется / видео не качается
+
+### `INPUT_MEDIA_WIDGET_NOT_ALLOWED`
+
+Это **не ошибка кода и не HTML**. С **13 ноября 2026** Telegram закрыл `sendWidget`
+обычным ботам в продакшене — даже в личном чате. Подтверждение контрибьютора Bot API
+`levlam`: [tdlib/telegram-bot-api#947](https://github.com/tdlib/telegram-bot-api/issues/947).
+Официальная страница до сих пор пишет «private chat: Yes», но сервер отвечает 400. Тоггла
+в BotFather нет, это серверный whitelist; срока возврата нет.
+
+Что делать:
+
+1. **Увидеть настоящий виджет** → `TELEGRAM_TEST_SERVER=1` в `.env`. Нужен **новый аккаунт
+   в тестовом окружении** (iOS: 10 тапов по Settings → Accounts → Login to another account →
+   Test; Desktop: Shift+Alt + ПКМ по «Add Account» → Test Server) и **новый бот у @BotFather
+   внутри него**. Токен от продакшен-бота не подойдёт. aiogram сам уйдёт на
+   `https://api.telegram.org/bot<token>/test/METHOD_NAME`.
+2. **В проде** → `TELEGRAM_WIDGETS=auto` (по умолчанию): бот уходит в тихий фолбэк на
+   inline-клавиатуру и **повторяет попытку раз в `WIDGET_RETRY_MIN` минут** — чат не залипает
+   на тексте навсегда. `off` — сразу фолбэк, без лишних запросов к API.
+3. Лог теперь прямо говорит причину: `Telegram отказал в виджете: INPUT_MEDIA_WIDGET_NOT_ALLOWED`.
+
+### «Видео не качаются»
+
+Сначала `.venv/bin/python bot.py --doctor` или `/diag`. Если в логе старта **нет** строки
+`WARNING ... ffmpeg не найден` — ffmpeg установлен, дело не в нём. Теперь каждое решение
+пишется в лог, так что по одной строке видно, где остановилось:
+
+| Строка в логе | Что это и что делать |
+|---|---|
+| `сообщение без http(s)-ссылки` | Прислали текст без `http(s)://` — нужна полная ссылка |
+| `ссылка отклонена: ... причина=Приватные адреса запрещены` | DNS площадки резолвится в `0.0.0.0`/private (часто при блокировках) — поставить `HTTPS_PROXY` или поправить DNS |
+| `rate limit: chat=...` | Больше `RATE_PER_30S` ссылок за 30 с — подождать или поднять лимит |
+| `разведка не удалась (...) HTTP Error 403` | Площадка режет датацентр/требует логин → `COOKIES_FILE` |
+| `разведка не удалась (...) Requested format is not available` | Нет подходящего формата → другое качество или `YTDLP_EXTRACTOR_ARGS` |
+| `job ТАЙМАУТ за N с` | Не отвечает площадка → `INSPECT_TIMEOUT` / `DOWNLOAD_TIMEOUT`, прокси |
+| `скачка не удалась (...) ffmpeg` | Без ffmpeg yt-dlp не может слить DASH-дорожки. Бот теперь просит только прогрессивные форматы; если их нет — честно пишет «Нет подходящего формата» |
+| `job failed за N с: ...` | Непредвиденное — вместе с traceback |
+
+Исправлено по ходу разбора: после merge берётся **итоговый** `info["filepath"]`, а не самый
+крупный исходник (иначе уезжал кусок без звука); `webm/mkv/mov` сразу идут документом
+(`sendVideo` их не ест); при >50 МБ без ffmpeg бот не падает, а даёт кнопку «Открыть источник»;
+удалённую пользователем карточку бот пересоздаёт, а не молча теряет обновления.
+
 ## Ограничения платформы (не баги, а Bot API 10.4)
 
-* Виджеты в проде — **только приватные чаты с ботом**, всегда `protect_content`, не форвардятся,
-  не копируются. Группы/инлайн/форварды — test server.
+* По документам виджеты в проде — **только приватные чаты с ботом**, всегда `protect_content`,
+  не форвардятся, не копируются; группы/инлайн/форварды — test server. **Фактически с
+  13.11.2026 прод закрыт для обычных ботов целиком** — см. раздел выше.
 * Старые клиенты (< layer 233) видят unsupported-медиа → бот ловит ошибку `sendWidget` и
   уходит в тихий фолбэк: одно текстовое сообщение + inline-клавиатура с теми же командами.
 * HTML виджета **не редактируется после отправки** — только `chat_data`. Поэтому все фазы
@@ -137,4 +186,5 @@ Dailymotion, Vimeo, Threads, Snapchat, Coub, Rumble, Yandex — плюс **вс�
 
 См. [`.env.example`](.env.example). Ключевое: `BOT_TOKEN`, `MODE`, `MAX_PARALLEL`,
 `MAX_QUEUE`, `MAX_UPLOAD_MB`, `MAX_ORIGINAL_MB`, `MAX_SLIDES`, `COOKIES_FILE`, `HTTPS_PROXY`,
-`USE_GALLERY_DL`, `DB_PATH`, `TMP_DIR`.
+`USE_GALLERY_DL`, `TELEGRAM_WIDGETS`, `WIDGET_RETRY_MIN`, `TELEGRAM_TEST_SERVER`,
+`YTDLP_EXTRACTOR_ARGS`, `DB_PATH`, `TMP_DIR`.

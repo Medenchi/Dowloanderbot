@@ -125,6 +125,35 @@ await bot.set_webhook(url=..., allowed_updates=[
 * 10.5 `setMySettings(callback_query_mode="default")` вызывается только при
   `ENSURE_CALLBACK_MODE_DEFAULT=1`, чтобы не менять глобальные настройки бота без запроса.
 
+### Продакшен-гейт `INPUT_MEDIA_WIDGET_NOT_ALLOWED` (с 13.11.2026)
+
+ОфициальнаяAvailability-таблица (`private chat: Yes`) **устарела де-факто**: с 13 ноября
+`sendWidget` в проде отвечает `400 Bad Request: INPUT_MEDIA_WIDGET_NOT_ALLOWED` даже в личке
+и даже с минимальным 42-байтовым HTML. Контрибьютор Bot API `levlam` подтвердил:
+«Yes, currently, general bots aren't allowed to use widgets even in private chats»
+— [tdlib/telegram-bot-api#947](https://github.com/tdlib/telegram-bot-api/issues/947).
+Ошибка не описана в `/bots/widgets` (там только `TOO_LARGE` / `HTML_INVALID` /
+`DATA_TOO_LARGE` / `DATA_INVALID`), но в `widget-sandbox/docs/tgw-format.md` она отнесена
+к гейту «the chat is not one a bot may send widgets to». Тоггла в BotFather нет — серверный
+конфиг/whitelist, срока снятия ограничения не объявляли.
+
+Практика для репо: `TELEGRAM_TEST_SERVER=1` (aiogram `AiohttpSession(api=TEST)`, путь
+`.../bot<token>/test/METHOD_NAME`, отдельный аккаунт и отдельный бот) — там виджеты доступны
+любому боту; в проде `TELEGRAM_WIDGETS=auto` + фолбэк с ретраем раз в `WIDGET_RETRY_MIN`
+минут. Отказ не кешируется насовсем (`Session.fallback_at`), иначе чат навсегда остаётся на
+текстовой клавиатуре после возврата доступа.
+
+### Диагностика «видео не качаются»
+
+`--doctor` / `/diag` показывают Python, aiogram, yt-dlp, `ffmpeg`/`ffprobe`/`gallery-dl`,
+режим API, DNS до `youtube.com` / `www.tiktok.com` / `api.telegram.org`, `getMe`, очередь и
+свободное место. Каждое решение в `on_text` и `run_job` логируется: `ссылка отклонена`,
+`rate limit`, `разведка не удалась`, `скачка: старт/готово`, `job ТАЙМАУТ`, `job failed`.
+Без ffmpeg `format_selector` просит только `best[...][vcodec!=none][acodec!=none]` и не
+выставляет `merge_output_format` — иначе yt-dlp брал DASH video-only и падал на
+`FFmpegMergerPP`. После merge берётся `info["filepath"]`, а не `max(size)` по
+`requested_downloads`.
+
 ## Ссылки
 
 - https://core.telegram.org/bots/api#sendwidget · https://core.telegram.org/bots/widgets · https://core.telegram.org/bots/api-changelog
