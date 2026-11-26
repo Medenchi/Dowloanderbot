@@ -68,8 +68,11 @@ _compat_python311_pydantic()
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TEST
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
+import aiogram
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
@@ -154,8 +157,48 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+def load_dotenv(path: Path | None = None) -> int:
+    """Минимальный .env-загрузчик на stdlib: без python-dotenv в зависимостях.
+    Реальный env хоста имеет приоритет — не перетираем уже выставленное."""
+    p = path or Path(".env")
+    if not p.is_file():
+        return 0
+    n = 0
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        val = val.strip()
+        if len(val) > 1 and val[0] in "\"'" and val[-1] == val[0]:
+            val = val[1:-1]
+        else:
+            val = val.split(" #", 1)[0].strip()   # inline-комментарий в .env.example
+        if key and key not in os.environ:
+            os.environ[key] = val
+            n += 1
+    return n
+
+
 def _env_bool(key: str, default: bool) -> bool:
     return _env(key, "1" if default else "0").lower() in ("1", "true", "yes", "on")
+
+
+def _env_choice(key: str, default: str, allowed: tuple[str, ...]) -> str:
+    v = _env(key, default).lower()
+    return v if v in allowed else default
+
+
+def _env_json(key: str) -> dict[str, Any]:
+    try:
+        v = json.loads(_env(key, "{}") or "{}")
+        return v if isinstance(v, dict) else {}
+    except (ValueError, TypeError):
+        log.warning("%s: невалидный JSON, игнорирую", key)
+        return {}
 
 
 @dataclass(frozen=True)
@@ -185,6 +228,10 @@ class Config:
     ensure_callback_mode_default: bool
     rate_per_30s: int
     log_level: str
+    widget_mode: str            # auto | on | off
+    test_server: bool           # /test/ endpoint, где виджеты разрешены всем
+    widget_retry_min: int       # TTL фолбэка, чтобы не залипнуть на нём навсегда
+    ytdlp_extractor_args: dict[str, Any]
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -214,6 +261,10 @@ class Config:
             ensure_callback_mode_default=_env_bool("ENSURE_CALLBACK_MODE_DEFAULT", False),
             rate_per_30s=_env_int("RATE_PER_30S", 4),
             log_level=_env("LOG_LEVEL", "INFO").upper(),
+            widget_mode=_env_choice("TELEGRAM_WIDGETS", "auto", ("auto", "on", "off")),
+            test_server=_env_bool("TELEGRAM_TEST_SERVER", False),
+            widget_retry_min=max(1, _env_int("WIDGET_RETRY_MIN", 60)),
+            ytdlp_extractor_args=_env_json("YTDLP_EXTRACTOR_ARGS"),
         )
 
     @property
@@ -235,6 +286,10 @@ class Config:
     @property
     def ffprobe(self) -> str | None:
         return shutil.which("ffprobe")
+
+    @property
+    def widget_retry_seconds(self) -> int:
+        return self.widget_retry_min * 60
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +474,11 @@ def friendly_error(exc: BaseException) -> str:
         return "Нужен доступ к посту (куки)"
     if "429" in low or "too many requests" in low or "rate limit" in low:
         return "Сервис ограничил запросы, попробуй позже"
-    if "ffmpeg" in low:
+    if "requested format is not available" in low or "no suitable formats" in low:
+        return "Нет подходящего формата, попробуй другое качество"
+    if "403" in low or "401" in low or "forbidden" in low:
+        return "Сервис запретил доступ (часто нужны куки)"
+    if "ffmpeg" in low or "ffprobe" in low:
         return "Нужен ffmpeg для этого формата"
     if "timeout" in low or "timed out" in low or "истёк" in low:
         return "Таймаут, попробуй ещё раз"
@@ -449,6 +508,7 @@ class Session:
     quality: str = "720"
     slides: list[dict[str, Any]] = field(default_factory=list)
     idx: int = 0
+    fallback_at: float = 0.0        # НЕ обновляется push_state: TTL отказа виджета
     updated: float = field(default_factory=time.time)
     last_push: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -457,7 +517,8 @@ class Session:
         return {
             "chat_id": self.chat_id, "widget_id": self.widget_id, "media_id": self.media_id,
             "mode": self.mode, "state": self.state, "url": self.url, "quality": self.quality,
-            "slides": self.slides, "idx": self.idx, "updated": self.updated,
+            "slides": self.slides, "idx": self.idx,
+            "fallback_at": self.fallback_at, "updated": self.updated,
         }
 
     @classmethod
@@ -466,7 +527,9 @@ class Session:
             chat_id=d["chat_id"], widget_id=d["widget_id"], media_id=d.get("media_id"),
             mode=d.get("mode", "widget"), state=d.get("state") or idle_state(),
             url=d.get("url", ""), quality=d.get("quality", "720"),
-            slides=d.get("slides") or [], idx=d.get("idx", 0), updated=d.get("updated", time.time()),
+            slides=d.get("slides") or [], idx=d.get("idx", 0),
+            fallback_at=float(d.get("fallback_at") or 0),
+            updated=d.get("updated", time.time()),
         )
 
 
@@ -511,6 +574,12 @@ class Store:
         row = self.db.execute("SELECT file_id,kind FROM files WHERE key=?", (key,)).fetchone()
         return (row[0], row[1]) if row else None
 
+    def drop(self, s: Session) -> None:
+        self.sessions.pop((s.chat_id, s.widget_id), None)
+        self.db.execute("DELETE FROM sessions WHERE chat_id=? AND widget_id=?",
+                        (s.chat_id, s.widget_id))
+        self.db.commit()
+
     def close(self) -> None:
         self.db.close()
 
@@ -527,13 +596,20 @@ class _Quiet:
 
 
 def format_selector(quality: str, has_ffmpeg: bool) -> str:
+    """Без ffmpeg просим ТОЛЬКО прогрессив (видео+аудио в одном файле).
+    Иначе yt-dlp берёт DASH video-only и падает на FFmpegMergerPP — это и
+    выглядело как «видео не качается» при отсутствии бинарника."""
     if quality == "a":
-        return "bestaudio/best"
+        return "bestaudio[ext=m4a]/bestaudio/best[vcodec=none]/best"
     h = int(quality) if quality.isdigit() else 720
-    progressive = f"best[height<={h}][ext=mp4]/best[height<={h}]/best"
+    progressive = (
+        f"best[height<={h}][vcodec!=none][acodec!=none][ext=mp4]/"
+        f"best[height<={h}][vcodec!=none][acodec!=none]/"
+        "best[vcodec!=none][acodec!=none]"
+    )
     if not has_ffmpeg:
-        return progressive   # без ffmpeg merge video+audio не собрать
-    return f"best[height<={h}][ext=mp4]/bestvideo[height<={h}]+bestaudio/{progressive}"
+        return progressive
+    return f"bestvideo[height<={h}]+bestaudio/{progressive}"
 
 
 def ydl_opts(cfg: Config, quality: str, *, download: bool,
@@ -546,8 +622,11 @@ def ydl_opts(cfg: Config, quality: str, *, download: bool,
         "max_filesize": cfg.max_original_bytes,       # режется в downloader/http.py
         "concurrent_fragment_downloads": 2,
         "overwrites": True, "restrictfilenames": True,
-        "merge_output_format": "mp4",
     }
+    if cfg.ffmpeg:                  # без ffmpeg вообще не просить merge/convert
+        o["merge_output_format"] = "mp4"
+    if cfg.ytdlp_extractor_args:
+        o["extractor_args"] = cfg.ytdlp_extractor_args
     if cfg.cookies_file and Path(cfg.cookies_file).is_file():
         o["cookiefile"] = cfg.cookies_file
     if cfg.proxy:
@@ -592,6 +671,7 @@ def inspect_media(url: str, quality: str, cfg: Config) -> dict[str, Any]:
         with yt_dlp.YoutubeDL(ydl_opts(cfg, quality, download=False)) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
+        log.warning("разведка не удалась (%s): %s: %s", url[:90], type(exc).__name__, exc)
         return {"kind": "error", "error": friendly_error(exc), "images": [], "has_video": False}
     if not isinstance(info, dict):
         return {"kind": "error", "error": "Пустой ответ", "images": [], "has_video": False}
@@ -627,6 +707,8 @@ def inspect_media(url: str, quality: str, cfg: Config) -> dict[str, Any]:
     if len(entries) > 1 and has_video:
         parts.append(f"плейлист, беру 1 из {len(entries)}")
     kind = "video" if has_video else ("images" if images else ("audio" if audio_only else "error"))
+    log.info("разведка: kind=%s video=%s audio=%s images=%d title=%r",
+             kind, has_video, audio_only, len(images), str(title)[:60])
     return {
         "kind": kind, "images": dedupe(images)[: cfg.max_slides],
         "has_video": has_video, "audio_only": audio_only and not has_video,
@@ -723,6 +805,8 @@ async def inspect_plan(svc: "Service", url: str, quality: str) -> dict[str, Any]
     meta = await asyncio.wait_for(
         asyncio.to_thread(inspect_media, url, quality, svc.cfg), timeout=svc.cfg.inspect_timeout
     )
+    log.info("план: host=%s kind=%s video=%s audio=%s err=%r", host or "?",
+             meta.get("kind"), meta.get("has_video"), meta.get("audio_only"), meta.get("error"))
     images = list(meta.get("images") or [])
     if "tiktok" in host and (meta.get("audio_only") or len(images) < 2):
         extra = await tiktok_images(svc, url)
@@ -742,7 +826,9 @@ async def inspect_plan(svc: "Service", url: str, quality: str) -> dict[str, Any]
                 "meta": meta.get("meta", ""), "many": meta.get("many", False)}
     if meta.get("audio_only"):
         return {"kind": "audio", "images": [], "title": meta.get("title", "Аудио"), "meta": meta.get("meta", "")}
-    raise FriendlyError(meta.get("error") or "Не нашёл медиа по ссылке")
+    reason = meta.get("error") or "Не нашёл медиа по ссылке"
+    log.warning("план: медиа не найдено (%s) url=%s", reason, url[:100])
+    raise FriendlyError(reason)
 
 
 def download_media(url: str, quality: str, cfg: Config, job: "Job", chat_id: int, wid: int,
@@ -752,22 +838,47 @@ def download_media(url: str, quality: str, cfg: Config, job: "Job", chat_id: int
     opts = ydl_opts(cfg, quality, download=True, dest=dest, job=job)
     if single:
         opts["playlist_items"] = "1"
+    log.info("скачка: старт q=%s ffmpeg=%s format=%s", quality, bool(cfg.ffmpeg), opts.get("format"))
+    started = time.monotonic()
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
     except Exception as exc:
+        log.warning("скачка не удалась (%s): %s: %s", url[:90], type(exc).__name__, exc)
         shutil.rmtree(dest, ignore_errors=True)
         raise FriendlyError(friendly_error(exc))
+    info = info if isinstance(info, dict) else {}
+    # После merge итоговый mp4 лежит в info["filepath"], а requested_downloads
+    # всё ещё указывает на video-only/audio-only куски. Берём именно итог,
+    # иначе уезжает «видео без звука» или вообще исходник без контейнера.
     files: list[Path] = []
-    for f in ((info or {}).get("requested_downloads") or []):
-        p = f.get("filepath") or f.get("filename")
-        if p and Path(p).is_file():
-            files.append(Path(p))
+    primary: Path | None = None
+    for raw in (info.get("filepath"), info.get("_filename")):
+        if isinstance(raw, str) and Path(raw).is_file():
+            primary = Path(raw)
+            files.append(primary)
+            break
+    for f in (info.get("requested_downloads") or []):
+        if not isinstance(f, dict):
+            continue
+        for k in ("filepath", "filename"):
+            p = f.get(k)
+            if isinstance(p, str) and Path(p).is_file():
+                files.append(Path(p))
     if not files:
-        files = [p for p in dest.iterdir() if p.is_file() and p.suffix not in (".part", ".ytdl")]
+        files = [p for p in dest.iterdir() if p.is_file()
+                 and not p.name.endswith((".part", ".ytdl", ".temp", ".tmp"))]
+    files = list(dict.fromkeys(files))
     if not files:
+        shutil.rmtree(dest, ignore_errors=True)
         raise FriendlyError("Не удалось получить файл")
-    path = max(files, key=lambda p: p.stat().st_size)
+    if primary is not None:
+        path = primary                       # итог после merge, даже если исходник крупнее
+    else:
+        mp4 = [p for p in files if p.suffix.lower() == ".mp4"]
+        path = max(mp4 or files, key=lambda p: p.stat().st_size)
+    log.info("скачка: готово за %.1f с, файлов=%d, выбран %s (%d Б)",
+             time.monotonic() - started, len(files), path.name, path.stat().st_size)
     if path.stat().st_size > cfg.max_original_bytes:
         raise FriendlyError("Оригинал слишком большой")
     job.percent = 82
@@ -876,7 +987,8 @@ def classify_path(path: Path, quality: str = "720") -> str:
     if quality == "a" or ext in AUDIO_EXTS:
         return "audio"
     if ext in VIDEO_EXTS:
-        return "video"
+        # sendVideo принимает только mp4; webm/mkv/mov сразу отдаём документом
+        return "video" if ext == ".mp4" else "document"
     if ext in PHOTO_EXTS and (not path.exists() or path.stat().st_size <= 10 * 1024 * 1024):
         return "photo"
     return "document"
@@ -994,6 +1106,9 @@ def fallback_kb(st: dict[str, Any]) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Ещё раз", callback_data="r"),
         InlineKeyboardButton(text="Отмена", callback_data="x"),
     ])
+    link = st.get("u")
+    if isinstance(link, str) and link.startswith("https://") and len(link) <= 256:
+        rows.append([InlineKeyboardButton(text="Открыть источник", url=link)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1001,8 +1116,20 @@ async def _do_push(svc: Service, s: Session, data: str) -> None:
     if s.mode == "widget":
         await svc.bot.edit_message_widget_data(chat_id=s.chat_id, message_id=s.widget_id, chat_data=data)
     else:
-        await svc.bot.edit_message_text(text=render_fallback(s.state), chat_id=s.chat_id,
-                                        message_id=s.widget_id, reply_markup=fallback_kb(s.state))
+        try:
+            await svc.bot.edit_message_text(text=render_fallback(s.state), chat_id=s.chat_id,
+                                            message_id=s.widget_id, reply_markup=fallback_kb(s.state))
+        except TelegramBadRequest as exc:
+            low = str(exc).lower()
+            if not any(x in low for x in ("message to edit not found", "message_id_invalid",
+                                          "message can't be edited", "message to edit not found")):
+                raise
+            log.info("карточка удалена пользователем — пересоздаю (chat=%s)", s.chat_id)
+            msg = await svc.bot.send_message(chat_id=s.chat_id, text=render_fallback(s.state),
+                                             reply_markup=fallback_kb(s.state))
+            s.widget_id = msg.message_id
+            s.fallback_at = s.fallback_at or time.time()
+            svc.store.save(s)
 
 
 async def push_state(svc: Service, s: Session, patch: dict[str, Any] | None = None,
@@ -1032,34 +1159,63 @@ async def push_state(svc: Service, s: Session, patch: dict[str, Any] | None = No
 
 
 async def ensure_card(svc: Service, chat_id: int) -> Session:
-    """Одна карточка на чат: сверху медиа, снизу виджет (или тихий фолбэк)."""
+    """Одна карточка на чат: сверху медиа, снизу виджет (или тихий фолбэк).
+
+    Отказ Telegram НЕ кешируется насовсем: через WIDGET_RETRY_MIN минут бот
+    снова пробует sendWidget (иначе чат навсегда залипает на тексте).
+    """
+    cfg = svc.cfg
     old = svc.store.latest(chat_id)
     if old:
-        return old
+        retry_due = (old.mode == "fallback" and old.fallback_at > 0
+                     and time.time() - old.fallback_at > cfg.widget_retry_seconds)
+        if not (cfg.widget_mode == "auto" and retry_due):
+            return old
+        log.info("повторная попытка sendWidget: chat=%s (отказ %.0f с назад)",
+                 chat_id, time.time() - old.fallback_at)
+        try:
+            await svc.bot.delete_message(chat_id=chat_id, message_id=old.widget_id)
+        except TelegramAPIError:
+            pass
+        svc.store.drop(old)
+
     state = idle_state()
     media = None
-    try:
-        media = await svc.bot.send_photo(chat_id=chat_id, photo=FSInputFile(svc.placeholder),
-                                         disable_notification=True)
-        w = await svc.bot.send_widget(
-            chat_id=chat_id, html=svc.widget_html, height=WIDGET_HEIGHT,
-            chat_data=compact_state(state), caption=WIDGET_CAPTION,
-            show_caption_above_media=True, allow_queries=True, is_shared=False,
-            disable_notification=True,
-        )
-        s = Session(chat_id=chat_id, widget_id=w.message_id, media_id=media.message_id,
-                    mode="widget", state=state)
-    except (TelegramBadRequest, TelegramAPIError) as exc:
-        log.info("виджет недоступен (%s) -> фолбэк", exc)
-        if media is not None:
-            try:
-                await svc.bot.delete_message(chat_id=chat_id, message_id=media.message_id)
-            except TelegramAPIError:
-                pass
-        msg = await svc.bot.send_message(chat_id=chat_id, text=render_fallback(state),
-                                         reply_markup=fallback_kb(state))
-        s = Session(chat_id=chat_id, widget_id=msg.message_id, media_id=None,
-                    mode="fallback", state=state)
+    if cfg.widget_mode != "off":
+        try:
+            media = await svc.bot.send_photo(chat_id=chat_id, photo=FSInputFile(svc.placeholder),
+                                             disable_notification=True)
+            w = await svc.bot.send_widget(
+                chat_id=chat_id, html=svc.widget_html, height=WIDGET_HEIGHT,
+                chat_data=compact_state(state), caption=WIDGET_CAPTION,
+                show_caption_above_media=True, allow_queries=True, is_shared=False,
+                disable_notification=True,
+            )
+            s = Session(chat_id=chat_id, widget_id=w.message_id, media_id=media.message_id,
+                        mode="widget", state=state)
+            svc.store.save(s)
+            log.info("виджет отправлен: chat=%s msg=%s", chat_id, w.message_id)
+            return s
+        except (TelegramBadRequest, TelegramAPIError) as exc:
+            text = str(exc)
+            if "INPUT_MEDIA_WIDGET_NOT_ALLOWED" in text.upper():
+                log.warning(
+                    "Telegram отказал в виджете: INPUT_MEDIA_WIDGET_NOT_ALLOWED. "
+                    "С 13.11.2026 обычным ботам в проде виджеты закрыты (tdlib/telegram-bot-api#947). "
+                    "Ретрай через %d мин; полный UI — TELEGRAM_TEST_SERVER=1.", cfg.widget_retry_min)
+            else:
+                log.warning("sendWidget не удался (%s): %s", type(exc).__name__, text)
+            if media is not None:
+                try:
+                    await svc.bot.delete_message(chat_id=chat_id, message_id=media.message_id)
+                except TelegramAPIError:
+                    pass
+    else:
+        log.info("TELEGRAM_WIDGETS=off: сразу фолбэк")
+    msg = await svc.bot.send_message(chat_id=chat_id, text=render_fallback(state),
+                                     reply_markup=fallback_kb(state))
+    s = Session(chat_id=chat_id, widget_id=msg.message_id, media_id=None,
+                mode="fallback", state=state, fallback_at=time.time())
     svc.store.save(s)
     return s
 
@@ -1104,12 +1260,27 @@ async def send_new_media(svc: Service, s: Session, media: Any) -> Message:
 
 async def deliver_media(svc: Service, s: Session, path: Path, dest: Path, quality: str,
                         info: dict[str, Any]) -> None:
-    if path.stat().st_size > svc.cfg.max_upload_bytes:
+    size = path.stat().st_size
+    if size > svc.cfg.max_upload_bytes:
         await push_state(svc, s, {"ph": "encode", "p": 90})
-        path = await asyncio.wait_for(
-            asyncio.to_thread(transcode, path, dest, svc.cfg, quality, info.get("duration")),
-            timeout=svc.cfg.encode_timeout + 10,
-        )
+        if svc.cfg.ffmpeg:
+            try:
+                path = await asyncio.wait_for(
+                    asyncio.to_thread(transcode, path, dest, svc.cfg, quality, info.get("duration")),
+                    timeout=svc.cfg.encode_timeout + 10,
+                )
+                size = path.stat().st_size
+            except Exception as exc:
+                log.warning("пережатие не удалось: %s: %s", type(exc).__name__, exc)
+        if size > 50 * 1024 * 1024:
+            # «extreme = link»: не валим бота загрузкой, даём кнопку на источник
+            await push_state(svc, s, {
+                "ph": "error", "p": 0,
+                "e": "Файл больше 50 МБ — открой источник кнопкой ниже",
+                "u": original_link(s.url),
+            })
+            shutil.rmtree(dest, ignore_errors=True)
+            return
     key = media_key(s.url, quality)
     cached = svc.store.get_file(key)
     kind = cached[1] if cached else classify_path(path, quality)
@@ -1123,6 +1294,7 @@ async def deliver_media(svc: Service, s: Session, path: Path, dest: Path, qualit
     fid = extract_file_id(msg)
     if fid and not cached:
         svc.store.cache_file(key, fid, kind)
+    log.info("доставка: kind=%s size=%d Б media_id=%s", kind, size, s.media_id)
     shutil.rmtree(dest, ignore_errors=True)
 
 
@@ -1180,6 +1352,8 @@ async def progress_reporter(svc: Service, s: Session, job: Job) -> None:
 
 
 async def run_job(svc: Service, s: Session, url: str, quality: str, job: Job) -> None:
+    started = time.monotonic()
+    log.info("job старт: chat=%s q=%s url=%s", s.chat_id, quality, url[:100])
     reporter = asyncio.create_task(progress_reporter(svc, s, job))
     try:
         async with svc.sem:
@@ -1188,6 +1362,8 @@ async def run_job(svc: Service, s: Session, url: str, quality: str, job: Job) ->
             await push_state(svc, s, {"ph": "meta", "p": 5}, force=True)
             job.phase, job.percent = "meta", 5
             plan = await inspect_plan(svc, url, quality)
+            log.info("job план: %s · %s (%.1f с)", plan["kind"],
+                     str(plan.get("title", ""))[:60], time.monotonic() - started)
 
             if plan["kind"] in ("carousel", "single"):
                 await push_state(svc, s, {
@@ -1221,18 +1397,24 @@ async def run_job(svc: Service, s: Session, url: str, quality: str, job: Job) ->
                 raise asyncio.CancelledError
             job.phase, job.percent = "up", 88
             await push_state(svc, s, {"ph": "up", "p": 88})
+            log.info("job: качка завершена за %.1f с, отдаём в чат", time.monotonic() - started)
             await deliver_media(svc, s, path, dest, quality, info)
             await push_state(svc, s, {"ph": "done", "p": 100, "m": plan["meta"] or "Готово · выбери качество"})
+            log.info("job готово за %.1f с: chat=%s", time.monotonic() - started, s.chat_id)
 
     except asyncio.CancelledError:
+        log.info("job отменён: chat=%s", s.chat_id)
         try:
             await push_state(svc, s, {"ph": "idle", "p": 0, "e": "", "t": "Отправь ссылку"})
         except (asyncio.CancelledError, Exception):
             pass
     except asyncio.TimeoutError:
+        log.warning("job ТАЙМАУТ за %.1f с: chat=%s url=%s",
+                    time.monotonic() - started, s.chat_id, url[:100])
         await push_state(svc, s, {"ph": "error", "p": 0, "e": "Таймаут, попробуй ещё раз"})
     except Exception as exc:
-        log.exception("job failed: %s", exc)
+        log.exception("job failed за %.1f с: %s: %s",
+                      time.monotonic() - started, type(exc).__name__, exc)
         if "Отменено" not in str(exc):
             await push_state(svc, s, {"ph": "error", "p": 0, "e": friendly_error(exc)})
     finally:
@@ -1269,6 +1451,7 @@ async def start_job(svc: Service, s: Session, url: str, quality: str) -> None:
     job = Job(widget_id=s.widget_id)
     job.task = asyncio.create_task(run_job(svc, s, url, quality, job))
     svc.jobs[key] = job
+    log.info("job поставлен: chat=%s q=%s url=%s", s.chat_id, quality, url[:100])
 
 
 async def handle_command(svc: Service, s: Session, cmd: str) -> None:
@@ -1321,6 +1504,14 @@ async def on_start(message: Message, bot: Bot, svc: Service) -> None:
                               "n": 0, "i": 0, "m": "YouTube · TikTok · Instagram · X · VK · и другие"})
 
 
+@router.message(Command("diag"))
+async def on_diag(message: Message, bot: Bot, svc: Service) -> None:
+    """Явная команда пользователя: бот молчит, пока её не попросили."""
+    lines = await diag_lines(svc, bot)
+    await bot.send_message(chat_id=message.chat.id, text="\n".join(lines)[:3800],
+                           disable_notification=True)
+
+
 @router.message(F.text)
 async def on_text(message: Message, bot: Bot, svc: Service) -> None:
     text = (message.text or "").strip()
@@ -1328,15 +1519,19 @@ async def on_text(message: Message, bot: Bot, svc: Service) -> None:
         return
     url = extract_url(text)
     if not url:
+        log.info("сообщение без http(s)-ссылки: chat=%s text=%r",
+                 message.chat.id, text[:60])
         s = await ensure_card(svc, message.chat.id)
         await push_state(svc, s, {"ph": "idle", "e": "Нужна ссылка http(s)"})
         return
     ok, why = await validate_url(url)
     s = await ensure_card(svc, message.chat.id)
     if not ok:
+        log.info("ссылка отклонена: chat=%s url=%s причина=%s", message.chat.id, url[:100], why)
         await push_state(svc, s, {"ph": "error", "e": why})
         return
     if not svc.allow_user(message.chat.id):
+        log.info("rate limit: chat=%s (%d ссылок / 30 с)", message.chat.id, svc.cfg.rate_per_30s)
         await push_state(svc, s, {"ph": "error", "e": "Слишком часто, подожди 30 секунд"})
         return
     await start_job(svc, s, url, s.quality or "720")
@@ -1353,6 +1548,7 @@ async def on_widget_query(q: WidgetQuery, bot: Bot, svc: Service) -> None:
         return
     s = svc.store.get(q.chat.id, q.message_id)
     if not s:
+        log.info("widget_query: сессия не найдена chat=%s msg=%s", q.chat.id, q.message_id)
         return
     try:
         await handle_command(svc, s, q.data)
@@ -1383,6 +1579,9 @@ async def on_callback(c: CallbackQuery, bot: Bot, svc: Service) -> None:
             await handle_command(svc, s, c.data or "")
         except Exception:
             log.exception("callback command %r", c.data)
+    else:
+        log.info("callback: сессия не найдена chat=%s msg=%s data=%r",
+                 c.message.chat.id, c.message.message_id, c.data)
 
 
 # ---------------------------------------------------------------------------
@@ -1391,6 +1590,72 @@ async def on_callback(c: CallbackQuery, bot: Bot, svc: Service) -> None:
 
 def load_widget_html() -> str:
     return Path(__file__).with_name("widget.html").read_text(encoding="utf-8")
+
+
+def _dns_lines_sync(hosts: tuple[str, ...] = ("youtube.com", "www.tiktok.com", "api.telegram.org")) -> list[str]:
+    """DNS-проверка с жёстким таймаутом (daemon-поток, без asyncio.run)."""
+    import threading
+    out: list[str] = []
+    for host in hosts:
+        box: dict[str, Any] = {}
+
+        def work(h: str = host, b: dict[str, Any] = box) -> None:
+            try:
+                b["ips"] = sorted({i[4][0] for i in socket.getaddrinfo(h, 443)})[:2]
+            except Exception as exc:
+                b["err"] = f"{type(exc).__name__}: {exc}"
+
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        th.join(5)
+        if "ips" in box:
+            out.append(f"DNS {host}: OK {', '.join(box['ips'])}")
+        elif "err" in box:
+            out.append(f"DNS {host}: ОШИБКА {box['err']}")
+        else:
+            out.append(f"DNS {host}: ТАЙМАУТ 5 с")
+    return out
+
+
+def environment_lines(cfg: Config) -> list[str]:
+    return [
+        f"Python {sys.version.split()[0]} · aiogram {aiogram.__version__} · yt-dlp {yt_dlp.version.__version__}",
+        f"ffmpeg: {cfg.ffmpeg or 'НЕ НАЙДЕН'} · ffprobe: {cfg.ffprobe or 'НЕ НАЙДЕН'}",
+        f"gallery-dl: {shutil.which('gallery-dl') or 'НЕ НАЙДЕН (опционально)'}",
+        f"API: {'TEST SERVER' if cfg.test_server else 'production'} · виджеты: {cfg.widget_mode}",
+        f"ретрай виджета: {cfg.widget_retry_min} мин · BOT_TOKEN: {'задан' if cfg.token else 'НЕ ЗАДАН'}",
+    ]
+
+
+def doctor() -> int:
+    """Проверка хоста БЕЗ токена: python bot.py --doctor."""
+    load_dotenv()
+    cfg = Config.from_env()
+    raw, packed = validate_widget_html(load_widget_html())
+    lines = [f"widget.html: {raw} Б raw / {packed} Б zlib-9 (лимит {MAX_HTML_ZLIB})"]
+    lines += environment_lines(cfg)
+    lines += _dns_lines_sync()
+    print("\n".join(lines))
+    return 0
+
+
+async def diag_lines(svc: Service, bot: Bot) -> list[str]:
+    """То же, но из чата: /diag."""
+    lines = environment_lines(svc.cfg)
+    lines.append(f"очередь: {svc.pending}/{svc.cfg.max_queue} · слотов: {svc.cfg.max_parallel}")
+    lines.append(f"сессий в БД: {len(svc.store.sessions)} · активных job: {len(svc.jobs)}")
+    lines += await asyncio.to_thread(_dns_lines_sync)
+    try:
+        me = await asyncio.wait_for(bot.get_me(), timeout=10)
+        lines.append(f"getMe: OK @{getattr(me, 'username', '?')}")
+    except Exception as exc:
+        lines.append(f"getMe: ОШИБКА {type(exc).__name__}: {exc}")
+    try:
+        disk = shutil.disk_usage(svc.cfg.tmp_dir)
+        lines.append(f"диск tmp/: свободно {disk.free // (1024 * 1024)} МБ")
+    except Exception:
+        pass
+    return lines
 
 
 def selfcheck() -> int:
@@ -1404,20 +1669,26 @@ def selfcheck() -> int:
 
 
 async def main() -> None:
+    load_dotenv()
     cfg = Config.from_env()
     logging.basicConfig(level=getattr(logging, cfg.log_level, logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if "--check" in sys.argv:
         raise SystemExit(selfcheck())
+    if "--doctor" in sys.argv:
+        raise SystemExit(doctor())
     if not cfg.token:
         raise SystemExit("Задай BOT_TOKEN в .env / окружении. Проверка без токена: python bot.py --check")
     widget_html = load_widget_html()
     raw, packed = validate_widget_html(widget_html)
     log.info("widget.html: %s Б raw / %s Б zlib-9", raw, packed)
+    for line in environment_lines(cfg):
+        log.info("старт: %s", line)
     if not cfg.ffmpeg:
-        log.warning("ffmpeg не найден: большие видео не будут пережиматься")
+        log.warning("ffmpeg не найден: слияние дорожек и пережатие >48 МБ недоступны")
 
-    bot = Bot(token=cfg.token, default=DefaultBotProperties())
+    session = AiohttpSession(api=TEST) if cfg.test_server else AiohttpSession()
+    bot = Bot(token=cfg.token, session=session, default=DefaultBotProperties())
     dp = Dispatcher()
     dp.include_router(router)
     store = Store(cfg.db_path)
@@ -1425,7 +1696,10 @@ async def main() -> None:
     await svc.start()
     dp["svc"] = svc                       # инъекция в хендлеры
     try:
-        await bot.set_my_commands([BotCommand(command="start", description="Открыть панель")])
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Открыть панель"),
+            BotCommand(command="diag", description="Диагностика бота"),
+        ])
     except TelegramAPIError:
         pass
     if cfg.ensure_callback_mode_default and hasattr(bot, "set_my_settings"):

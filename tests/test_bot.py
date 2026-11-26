@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import struct
+import time
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -177,8 +178,11 @@ def test_validate_url_blocks_ssrf(monkeypatch):
 
 def test_format_selector():
     assert "bestaudio" in bot.format_selector("a", True)
-    assert "+" not in bot.format_selector("720", False)   # без ffmpeg только прогрессив
+    no_ff = bot.format_selector("720", False)
+    assert "+" not in no_ff                       # без ffmpeg только прогрессив
+    assert "acodec!=none" in no_ff                # ... и обязательно со звуком
     assert "bestvideo" in bot.format_selector("1080", True)
+    assert "+" in bot.format_selector("1080", True)
 
 
 def test_ydl_opts_cap(tmp_path, cfg):
@@ -188,8 +192,17 @@ def test_ydl_opts_cap(tmp_path, cfg):
     assert o["playlistend"] == cfg.max_slides
 
 
+def test_ydl_opts_merge_gated_on_ffmpeg(cfg, monkeypatch):
+    monkeypatch.setattr(bot.shutil, "which", lambda name: None)
+    assert "merge_output_format" not in bot.ydl_opts(cfg, "720", download=False)
+    monkeypatch.setattr(bot.shutil, "which", lambda name: "/usr/bin/" + name)
+    assert bot.ydl_opts(cfg, "720", download=False)["merge_output_format"] == "mp4"
+
+
 def test_classify_path(tmp_path):
     assert bot.classify_path(tmp_path / "a.mp4") == "video"
+    assert bot.classify_path(tmp_path / "a.webm") == "document"   # sendVideo не ест webm
+    assert bot.classify_path(tmp_path / "a.mkv") == "document"
     assert bot.classify_path(tmp_path / "a.mp3") == "audio"
     assert bot.classify_path(tmp_path / "a.jpg") == "photo"
     big = tmp_path / "big.jpg"
@@ -465,6 +478,265 @@ def test_on_text_starts_job(tmp_path, cfg, monkeypatch):
                       text="глянь https://www.tiktok.com/@u/photo/123!")
         await bot.on_text(msg, fake, svc)
         assert calls == [("https://www.tiktok.com/@u/photo/123", "720")]
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+# --- диагностика, ретрай виджета, большие файлы ---------------------------
+
+def test_config_widget_flags(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_TEST_SERVER", "1")
+    monkeypatch.setenv("TELEGRAM_WIDGETS", "off")
+    monkeypatch.setenv("WIDGET_RETRY_MIN", "5")
+    monkeypatch.setenv("TELEGRAM_WIDGETS", "off")
+    c = bot.Config.from_env()
+    assert c.test_server is True
+    assert c.widget_mode == "off"
+    assert c.widget_retry_seconds == 300
+    monkeypatch.setenv("TELEGRAM_WIDGETS", "что-то-не-то")
+    assert bot.Config.from_env().widget_mode == "auto"
+
+
+def test_widget_mode_off_skips_send_widget(tmp_path, cfg):
+    async def run():
+        svc, fake = fresh_service(tmp_path)
+        object.__setattr__(svc.cfg, "widget_mode", "off")
+        s = await bot.ensure_card(svc, 777)
+        assert s.mode == "fallback"
+        assert all(kind != "widget" for kind, _ in fake.sent)
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_fallback_retries_widget_after_ttl(tmp_path, cfg):
+    async def run():
+        svc, fake = fresh_service(tmp_path, widget_fails=True)
+        s = await bot.ensure_card(svc, 777)
+        assert s.mode == "fallback" and s.fallback_at > 0
+        # симулируем «прошло больше WIDGET_RETRY_MIN» — updated не должен сбрасывать TTL
+        s.updated = time.time()
+        s.fallback_at = time.time() - svc.cfg.widget_retry_seconds - 10
+        fake.widget_fails = False
+        s2 = await bot.ensure_card(svc, 777)
+        assert s2.mode == "widget"
+        assert [k for k, _ in fake.sent][-2:] == ["photo", "widget"]
+        assert len(svc.store.sessions) == 1
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_fallback_not_retried_before_ttl(tmp_path, cfg):
+    async def run():
+        svc, fake = fresh_service(tmp_path, widget_fails=True)
+        s = await bot.ensure_card(svc, 777)
+        fake.widget_fails = False
+        s2 = await bot.ensure_card(svc, 777)
+        assert s2 is s and s2.mode == "fallback"
+        assert not any(k == "widget" for k, _ in fake.sent)
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_push_state_recreates_deleted_card(tmp_path, cfg):
+    from aiogram.exceptions import TelegramBadRequest
+
+    class DeletedBot(FakeBot):
+        def __init__(self):
+            super().__init__(widget_fails=True)
+            self.edit_calls = 0
+
+        async def edit_message_text(self, **kw):
+            self.edit_calls += 1
+            raise TelegramBadRequest(method="editMessageText",
+                                     message="Bad Request: message to edit not found")
+
+    async def run():
+        fake = DeletedBot()
+        c = bot.Config.from_env()
+        object.__setattr__(c, "tmp_dir", tmp_path / "tmp3")
+        object.__setattr__(c, "db_path", tmp_path / "state3.sqlite3")
+        svc = bot.Service(c, fake, bot.Store(c.db_path), bot.load_widget_html(),
+                          c.tmp_dir / "placeholder.png")
+        s = await bot.ensure_card(svc, 777)
+        before = sum(1 for k, _ in fake.sent if k == "message")
+        await bot.push_state(svc, s, {"ph": "error", "e": "тест"})
+        after = sum(1 for k, _ in fake.sent if k == "message")
+        assert before == 1 and after == 2
+        assert fake.edit_calls == 1
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_fallback_kb_has_source_button():
+    st = bot.idle_state()
+    st["u"] = "https://www.youtube.com/watch?v=abc"
+    rows = bot.fallback_kb(st).model_dump()["inline_keyboard"]
+    assert rows[-1][0]["url"].startswith("https://")
+    assert not rows[-1][0].get("callback_data")
+
+
+def test_download_media_prefers_merged_mp4(tmp_path, cfg, monkeypatch):
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download=False):
+            dest = Path(self.opts["outtmpl"]).parent
+            src = dest / "video.f137.mp4"
+            src.write_bytes(b"x" * 500)             # исходник БОЛЬШЕ итога
+            merged = dest / "final.mp4"
+            merged.write_bytes(b"y" * 100)          # но нужен именно он
+            return {"filepath": str(merged),
+                    "requested_downloads": [{"filepath": str(src)}],
+                    "duration": 12, "width": 640, "height": 360}
+
+    monkeypatch.setattr(bot.yt_dlp, "YoutubeDL", FakeYDL)
+    c = bot.Config.from_env()
+    object.__setattr__(c, "tmp_dir", tmp_path / "dl")
+    path, dest, info = bot.download_media("https://example.com/v", "720", c,
+                                          bot.Job(widget_id=1), 777, 1)
+    assert path.name == "final.mp4"
+    assert info["duration"] == 12
+    bot.shutil.rmtree(dest, ignore_errors=True)
+
+
+def test_deliver_media_oversize_gives_link(tmp_path, cfg, monkeypatch):
+    async def run():
+        svc, fake = fresh_service(tmp_path)
+        s = await bot.ensure_card(svc, 777)
+        s.url = "https://www.youtube.com/watch?v=abc"
+        dest = svc.cfg.tmp_dir / "big"
+        dest.mkdir(parents=True, exist_ok=True)
+        p = dest / "huge.mp4"
+        with p.open("wb") as f:
+            f.truncate(51 * 1024 * 1024)           # sparse, без реальных 51 МБ
+        monkeypatch.setattr(bot.shutil, "which", lambda name: None)  # ffmpeg нет
+        await bot.deliver_media(svc, s, p, dest, "720", {})
+        assert s.state["ph"] == "error"
+        assert "источник" in s.state["e"]
+        assert s.state["u"].startswith("https://")
+        assert not any(k in ("video", "document") for k, _ in fake.sent)
+        assert not dest.exists()                   # tmp убрали
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_diag_command(tmp_path, cfg, monkeypatch):
+    async def run():
+        svc, fake = fresh_service(tmp_path)
+
+        async def fake_diag(service, b):
+            return ["OK-строка"]
+
+        monkeypatch.setattr(bot, "diag_lines", fake_diag)
+        msg = Message(message_id=7, date=datetime.now(timezone.utc),
+                      chat=Chat(id=777, type="private"), text="/diag")
+        await bot.on_diag(msg, fake, svc)
+        assert fake.sent[-1][0] == "message"
+        assert "OK-строка" in fake.sent[-1][1]["text"]
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_doctor_prints_environment(monkeypatch, capsys):
+    monkeypatch.setattr(bot, "_dns_lines_sync", lambda: ["DNS stub: OK"])
+    assert bot.doctor() == 0
+    out = capsys.readouterr().out
+    assert "widget.html" in out
+    assert "aiogram" in out and "ffmpeg" in out
+    assert "DNS stub" in out
+
+
+def test_friendly_error_new_cases():
+    assert "качество" in bot.friendly_error(Exception("Requested format is not available"))
+    assert "куки" in bot.friendly_error(Exception("HTTP Error 403: Forbidden"))
+    assert "ffmpeg" in bot.friendly_error(Exception("ffmpeg not found"))
+
+
+def test_load_dotenv_parses_inline_comments_and_keeps_env(tmp_path, monkeypatch):
+    p = tmp_path / ".env"
+    p.write_text(
+        "# комментарий\n"
+        "TESTDL_TOKEN=abc:123\n"
+        "TESTDL_NUM=7            # одновременно качающих\n"
+        "export TESTDL_QUOTED=\"hello world\"\n"
+        "TESTDL_ARGS={\"youtube\":{\"player_client\":[\"web\"]}}\n"
+        "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TESTDL_TOKEN", raising=False)
+    monkeypatch.delenv("TESTDL_NUM", raising=False)
+    monkeypatch.delenv("TESTDL_QUOTED", raising=False)
+    monkeypatch.delenv("TESTDL_ARGS", raising=False)
+    assert bot.load_dotenv(p) == 4
+    assert os.environ["TESTDL_TOKEN"] == "abc:123"
+    assert os.environ["TESTDL_NUM"] == "7"
+    assert os.environ["TESTDL_QUOTED"] == "hello world"
+    assert os.environ["TESTDL_ARGS"].startswith("{")
+
+
+def test_load_dotenv_does_not_override_host_env(tmp_path, monkeypatch):
+    p = tmp_path / ".env"
+    p.write_text("TESTDL_KEEP=from-file\n", encoding="utf-8")
+    monkeypatch.setenv("TESTDL_KEEP", "from-host")
+    bot.load_dotenv(p)
+    assert os.environ["TESTDL_KEEP"] == "from-host"
+
+
+def test_env_example_is_parseable(monkeypatch):
+    """README обещает `cp .env.example .env` — файл должен реально грузиться."""
+    p = Path(__file__).resolve().parents[1] / ".env.example"
+    for key in ("MAX_PARALLEL", "TELEGRAM_WIDGETS", "TELEGRAM_TEST_SERVER", "WIDGET_RETRY_MIN"):
+        monkeypatch.delenv(key, raising=False)
+    assert bot.load_dotenv(p) > 0
+    assert os.environ["MAX_PARALLEL"] == "2"
+    assert os.environ["TELEGRAM_WIDGETS"] == "auto"
+    assert os.environ["TELEGRAM_TEST_SERVER"] == "0"
+    assert os.environ["WIDGET_RETRY_MIN"] == "60"
+
+
+def test_run_job_video_flow(tmp_path, cfg, monkeypatch):
+    """Сквозной путь «ссылка -> mp4 -> чат» без сети: то, что жаловалось в логах."""
+    async def run():
+        svc, s, fake = make_service(tmp_path, cfg)
+
+        async def fake_plan(service, url, quality):
+            return {"kind": "video", "images": [], "title": "Тест", "meta": "0:12", "many": False}
+
+        def fake_download(url, quality, c, job, chat_id, wid, single=False):
+            d = c.tmp_dir / "v-fake"
+            d.mkdir(parents=True, exist_ok=True)
+            p = d / "clip.mp4"
+            p.write_bytes(b"mp4-bytes")
+            job.percent = 82
+            return p, d, {"duration": 12, "width": 640, "height": 360}
+
+        monkeypatch.setattr(bot, "inspect_plan", fake_plan)
+        monkeypatch.setattr(bot, "download_media", fake_download)
+        monkeypatch.setattr(bot, "cleanup_old", lambda service: None)
+
+        job = bot.Job(widget_id=s.widget_id)
+        await bot.run_job(svc, s, s.url, "720", job)
+        assert s.state["ph"] == "done" and s.state["p"] == 100
+        assert job.done is True and svc.pending == 0
+        assert fake.media_calls, "медиа не ушло в чат"
+        from aiogram.types import InputMediaVideo
+        assert isinstance(fake.media_calls[0]["media"], InputMediaVideo)
+        phases = [json.loads(c["chat_data"])["ph"] for c in fake.state_calls]
+        assert "meta" in phases and "down" in phases and phases[-1] == "done"
         svc.store.close()
 
     asyncio.run(run())
