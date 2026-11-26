@@ -46,8 +46,8 @@ cp .env.example .env          # вписать BOT_TOKEN
 .venv/bin/python bot.py
 ```
 
-В чате: `/diag` — тот же отчёт плюс `getMe`, очередь, число сессий и свободное место.
-Бот молчит, пока не попросили.
+В чате: `/diag` — тот же отчёт плюс `getMe`, очередь, число сессий, `maxRSS`/потоки
+и свободное место. Бот молчит, пока не попросили.
 
 `MODE=polling` по умолчанию. Для `MODE=webhook` задать `WEBHOOK_URL`, `WEBHOOK_SECRET`,
 `WEBHOOK_HOST=0.0.0.0`, `WEBHOOK_PORT`; `allowed_updates` уже включает `widget_query` и
@@ -163,6 +163,33 @@ Dailymotion, Vimeo, Threads, Snapchat, Coub, Rumble, Yandex — плюс **вс�
 (`sendVideo` их не ест); при >50 МБ без ffmpeg бот не падает, а даёт кнопку «Открыть источник»;
 удалённую пользователем карточку бот пересоздаёт, а не молча теряет обновления.
 
+### «Зависает после рестарта, одни и те же ссылки по кругу»
+
+Разбирали на `https://l.likee.video/v/...`: короткий домен **не входит** в `_VALID_URL`
+`LikeeIE`, yt-dlp падал в `generic`-экстрактор и уходил грузить страницу. Плюс
+`asyncio.to_thread` **не убивается** `asyncio.wait_for` — поток остаётся жить, а
+`drop_pending_updates=False` после рестарта возвращал те же апдейты: две одинаковые
+задачи, две сети, снова «ничего не происходит» → ручной рестарт. Замкнутый круг.
+
+Что сделано:
+* `l.likee.video` / `m.likee.video` / `likee.com` нормализуются в `likee.video` — теперь
+  срабатывает родной `LikeeIE`, а не generic;
+* **разведка вынесена в отдельный процесс** (`sys.executable -m yt_dlp -J ...`,
+  `subprocess.run(timeout=INSPECT_TIMEOUT)`): зависший/упавший экстрактор kill'ится
+  гарантированно и не роняет бот, таймаут виден в логе. `YTDLP_ISOLATE_INSPECT=0`
+  возвращает старый потоковый режим;
+* `DROP_PENDING_UPDATES=1` по умолчанию + дедуп активной задачи по `(url, quality)` +
+  игнор апдейтов старше времени старта процесса;
+* отменённая задача больше не вычищает из `svc.jobs` задачу-преемника;
+* `SystemExit`/`KeyboardInterrupt` из `to_thread` гасятся внутри `run_job`, а не пробрасываются
+  в event loop;
+* `SIGTERM` логируется («процесс останавливают извне») — сразу видно, что убил процесс
+  хост, а не бот. Если процесс всё же подвис, включи `FAULTHANDLER_INTERVAL=60` на время
+  отладки: в stderr пойдут стеки всех потоков (по умолчанию выключено, чтобы не сорить логи).
+
+Новые строки лога: `нормализовал ссылку`, `разведка: subprocess старт/rc/ТАЙМАУТ`,
+`дубль ссылки, пропускаю`, `пропускаю устаревший update`, `получен сигнал SIGTERM`.
+
 ## Ограничения платформы (не баги, а Bot API 10.4)
 
 * По документам виджеты в проде — **только приватные чаты с ботом**, всегда `protect_content`,
@@ -187,4 +214,5 @@ Dailymotion, Vimeo, Threads, Snapchat, Coub, Rumble, Yandex — плюс **вс�
 См. [`.env.example`](.env.example). Ключевое: `BOT_TOKEN`, `MODE`, `MAX_PARALLEL`,
 `MAX_QUEUE`, `MAX_UPLOAD_MB`, `MAX_ORIGINAL_MB`, `MAX_SLIDES`, `COOKIES_FILE`, `HTTPS_PROXY`,
 `USE_GALLERY_DL`, `TELEGRAM_WIDGETS`, `WIDGET_RETRY_MIN`, `TELEGRAM_TEST_SERVER`,
-`YTDLP_EXTRACTOR_ARGS`, `DB_PATH`, `TMP_DIR`.
+`YTDLP_EXTRACTOR_ARGS`, `YTDLP_ISOLATE_INSPECT`, `DROP_PENDING_UPDATES`,
+`FAULTHANDLER_INTERVAL`, `YTDLP_CLI_EXTRA`, `DB_PATH`, `TMP_DIR`.

@@ -143,6 +143,23 @@ await bot.set_webhook(url=..., allowed_updates=[
 минут. Отказ не кешируется насовсем (`Session.fallback_at`), иначе чат навсегда остаётся на
 текстовой клавиатуре после возврата доступа.
 
+### Зависание разведки и петля рестартов (кейс `l.likee.video`)
+
+`LikeeIE._VALID_URL` в yt-dlp 2026.11.23 — `https?://(www\.)?likee\.video/...`; короткий
+домен `l.likee.video` не подходит ни одному экстрактору, поэтому включается `generic`,
+который грузит страницу и может надолго зависнуть на TLS. Проверено локально:
+`ERROR: [generic] uc96FR: Unable to download webpage: TLS/SSL connection has been closed`,
+при этом yt-dlp CLI с `-J` печатает `null` в stdout **и возвращает rc=0** — полагаться
+только на returncode нельзя, надо смотреть `stderr` и `"null"`.
+
+`asyncio.to_thread` + `asyncio.wait_for` отменяет корутину, но **не убивает поток**. Вместе с
+`delete_webhook(drop_pending_updates=False)` это давало петлю: рестарт → те же pending
+апдейты → две одинаковые задачи → снова зависание. Лечение: нормализация коротких доменов,
+разведка в отдельном процессе с `subprocess.run(timeout=...)`, `drop_pending_updates=True`,
+дедуп по `(url, quality)`, игнор устаревших `message.date`, `faulthandler.dump_traceback_later`
+и логирование `SIGTERM`. `SystemExit` из потока гасится в `run_job`, иначе asyncio.Task
+пробрасывает его в event loop и завершает процесс.
+
 ### Диагностика «видео не качаются»
 
 `--doctor` / `/diag` показывают Python, aiogram, yt-dlp, `ffmpeg`/`ffprobe`/`gallery-dl`,

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import struct
+import sys
 import time
 import zlib
 from datetime import datetime, timezone
@@ -740,3 +741,165 @@ def test_run_job_video_flow(tmp_path, cfg, monkeypatch):
         svc.store.close()
 
     asyncio.run(run())
+
+
+# --- изоляция разведки, дубли и короткие домены ----------------------------
+
+def test_normalize_url_short_likee_domain():
+    assert bot.normalize_url("https://l.likee.video/v/uc96FR") == "https://likee.video/v/uc96FR"
+    assert bot.normalize_url("https://l.likee.video/v/uc96FR?x=1#f") == "https://likee.video/v/uc96FR?x=1#f"
+    assert bot.normalize_url("https://www.youtube.com/watch?v=abc") == "https://www.youtube.com/watch?v=abc"
+    assert bot.source_label("https://l.likee.video/v/uc96FR") == "Likee"
+
+
+def test_ydl_cli_cmd_isolated(cfg):
+    cmd = bot.ydl_cli_cmd("https://likee.video/v/uc96FR", cfg)
+    assert cmd[:3] == [sys.executable, "-m", "yt_dlp"]
+    for flag in ("-J", "--no-warnings", "--no-progress", "--ignore-no-formats-error",
+                 "--skip-download", "--socket-timeout", "--retries"):
+        assert flag in cmd
+    assert cmd[-1] == "https://likee.video/v/uc96FR"
+
+
+def test_inspect_media_cli_parses_json(cfg, monkeypatch):
+    import subprocess
+    info = {"title": "Кот", "duration": 12, "formats": [{"vcodec": "h264", "acodec": "aac"}]}
+    r = subprocess.CompletedProcess(args=[], returncode=0,
+                                    stdout=json.dumps(info, ensure_ascii=False), stderr="")
+    monkeypatch.setattr(bot.subprocess, "run", lambda *a, **kw: r)
+    out = bot.inspect_media_cli("https://example.com/v", "720", cfg)
+    assert out["kind"] == "video" and out["title"] == "Кот"
+
+
+def test_inspect_media_cli_null_stdout_is_error(cfg, monkeypatch):
+    import subprocess
+    r = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="null\n",
+        stderr="ERROR: [generic] uc96FR: Unable to download webpage: TLS/SSL connection has been closed")
+    monkeypatch.setattr(bot.subprocess, "run", lambda *a, **kw: r)
+    out = bot.inspect_media_cli("https://l.likee.video/v/x", "720", cfg)
+    assert out["kind"] == "error"
+    assert "Сайт не ответил" in out["error"]
+
+
+def test_inspect_media_cli_timeout(cfg, monkeypatch):
+    import subprocess
+
+    def boom(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd="yt-dlp", timeout=kw["timeout"])
+
+    monkeypatch.setattr(bot.subprocess, "run", boom)
+    out = bot.inspect_media_cli("https://example.com/v", "720", cfg)
+    assert out["kind"] == "error" and "Таймаут" in out["error"]
+
+
+def test_inspect_plan_uses_cli_when_isolated(tmp_path, cfg, monkeypatch):
+    async def run():
+        svc, fake = fresh_service(tmp_path)
+        calls = []
+
+        def fake_cli(url, quality, c):
+            calls.append(url)
+            return bot.inspect_error("тест")
+
+        def forbidden_thread(url, quality, c):
+            raise AssertionError("потоковый режим не должен вызываться")
+
+        monkeypatch.setattr(bot, "inspect_media_cli", fake_cli)
+        monkeypatch.setattr(bot, "inspect_media", forbidden_thread)
+        object.__setattr__(svc.cfg, "isolate_inspect", True)
+        with pytest.raises(bot.FriendlyError):
+            await bot.inspect_plan(svc, "https://example.com/v", "720")
+        assert calls == ["https://example.com/v"]
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_start_job_dedup_same_url(tmp_path, cfg, monkeypatch):
+    async def run():
+        svc, s, fake = make_service(tmp_path, cfg)
+        started = []
+
+        async def fake_run(service, session, url, q, job):
+            started.append(url)
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(bot, "run_job", fake_run)
+        await bot.start_job(svc, s, "https://likee.video/v/x", "720")
+        await bot.start_job(svc, s, "https://likee.video/v/x", "720")   # дубль из pending
+        await asyncio.sleep(0)                    # дать create_task стартовать
+        assert started == ["https://likee.video/v/x"]
+        assert len(svc.jobs) == 1
+        assert svc.jobs[(s.chat_id, s.widget_id)].url == "https://likee.video/v/x"
+        for job in list(svc.jobs.values()):
+            job.task.cancel()
+        await asyncio.sleep(0)
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_on_text_skips_stale_update(tmp_path, cfg, monkeypatch):
+    from datetime import timedelta
+    async def run():
+        svc, fake = fresh_service(tmp_path)
+        calls = []
+
+        async def fake_start(service, session, url, quality):
+            calls.append(url)
+
+        monkeypatch.setattr(bot, "start_job", fake_start)
+        msg = Message(message_id=9, date=datetime.now(timezone.utc) - timedelta(days=1),
+                      chat=Chat(id=777, type="private"),
+                      text="https://likee.video/v/x")
+        await bot.on_text(msg, fake, svc)
+        assert calls == []
+        assert not fake.sent                 # карточку тоже не трогаем
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_run_job_does_not_pop_successor(tmp_path, cfg, monkeypatch):
+    async def run():
+        svc, s, fake = make_service(tmp_path, cfg)
+
+        async def fail_plan(service, url, quality):
+            raise bot.FriendlyError("тест")
+
+        monkeypatch.setattr(bot, "inspect_plan", fail_plan)
+        monkeypatch.setattr(bot, "cleanup_old", lambda service: None)
+        key = (s.chat_id, s.widget_id)
+        successor = bot.Job(widget_id=s.widget_id, url="next")
+        svc.jobs[key] = successor
+        job = bot.Job(widget_id=s.widget_id, url="old")
+        await bot.run_job(svc, s, "old", "720", job)
+        assert svc.jobs.get(key) is successor
+        assert job.done is True
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_config_isolation_flags(monkeypatch):
+    monkeypatch.setenv("YTDLP_ISOLATE_INSPECT", "0")
+    monkeypatch.setenv("DROP_PENDING_UPDATES", "0")
+    monkeypatch.setenv("FAULTHANDLER_INTERVAL", "0")
+    monkeypatch.setenv("YTDLP_CLI_EXTRA", "--force-ipv4 --no-check-certificates")
+    c = bot.Config.from_env()
+    assert c.isolate_inspect is False
+    assert c.drop_pending_updates is False
+    assert c.faulthandler_interval == 0
+    assert c.ytdlp_cli_extra == "--force-ipv4 --no-check-certificates"
+
+
+def test_friendly_error_network_cause():
+    assert "Сайт не ответил" in bot.friendly_error(Exception("Unable to download webpage: TLS/SSL"))
+    assert bot.friendly_error(Exception("Unsupported URL")) == "Ссылка не поддерживается"
+
+
+def test_environment_lines_show_isolation(cfg):
+    text = " ".join(bot.environment_lines(cfg))
+    assert "subprocess" in text
+    assert "drop_pending_updates" in text
