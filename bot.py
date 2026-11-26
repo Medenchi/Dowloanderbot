@@ -34,6 +34,7 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -136,7 +137,17 @@ SOURCE_MAP = (
     ("dailymotion.com", "Dailymotion"), ("vimeo.com", "Vimeo"),
     ("threads.net", "Threads"), ("snapchat.com", "Snapchat"),
     ("coub.com", "Coub"), ("rumble.com", "Rumble"), ("yandex.ru", "Yandex"),
+    ("likee.video", "Likee"), ("l.likee.video", "Likee"),
 )
+
+# Короткие домены, которых нет в _VALID_URL экстракторов yt-dlp. Без замены
+# l.likee.video уходит в generic IE и виснет на загрузке страницы вместо LikeeIE.
+SHORT_HOST_MAP = {
+    "l.likee.video": "likee.video",
+    "m.likee.video": "likee.video",
+    "likee.com": "likee.video",
+    "share.likee.video": "likee.video",
+}
 
 
 def _env(key: str, default: str = "") -> str:
@@ -232,6 +243,10 @@ class Config:
     test_server: bool           # /test/ endpoint, где виджеты разрешены всем
     widget_retry_min: int       # TTL фолбэка, чтобы не залипнуть на нём навсегда
     ytdlp_extractor_args: dict[str, Any]
+    isolate_inspect: bool       # разведка в отдельном ПРОЦЕССЕ с kill по таймауту
+    drop_pending_updates: bool  # не перечитывать старые апдейты после рестарта
+    faulthandler_interval: int  # 0 = выкл; дамп стеков, если бот завис
+    ytdlp_cli_extra: str        # доп. флаги yt-dlp CLI через shlex
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -265,6 +280,10 @@ class Config:
             test_server=_env_bool("TELEGRAM_TEST_SERVER", False),
             widget_retry_min=max(1, _env_int("WIDGET_RETRY_MIN", 60)),
             ytdlp_extractor_args=_env_json("YTDLP_EXTRACTOR_ARGS"),
+            isolate_inspect=_env_bool("YTDLP_ISOLATE_INSPECT", True),
+            drop_pending_updates=_env_bool("DROP_PENDING_UPDATES", True),
+            faulthandler_interval=max(0, _env_int("FAULTHANDLER_INTERVAL", 0)),
+            ytdlp_cli_extra=_env("YTDLP_CLI_EXTRA"),
         )
 
     @property
@@ -413,6 +432,19 @@ def extract_url(text: str) -> str | None:
     return m.group(0).rstrip(TRAILING)
 
 
+def normalize_url(url: str) -> str:
+    """Привести короткий домен к тому, что реально знает yt-dlp."""
+    u = urllib.parse.urlsplit(url)
+    host = (u.hostname or "").lower()
+    new = SHORT_HOST_MAP.get(host)
+    if not new:
+        return url
+    netloc = new + (f":{u.port}" if u.port else "")
+    fixed = urllib.parse.urlunsplit((u.scheme or "https", netloc, u.path, u.query, u.fragment))
+    log.info("нормализовал ссылку: %s -> %s", host, new)
+    return fixed
+
+
 def source_label(url: str) -> str:
     host = (urllib.parse.urlparse(url).hostname or "").lower()
     for needle, label in SOURCE_MAP:
@@ -470,6 +502,9 @@ def friendly_error(exc: BaseException) -> str:
     low = msg.lower()
     if "unsupported url" in low or "no video formats" in low:
         return "Ссылка не поддерживается"
+    if ("unable to download webpage" in low or "tls/ssl" in low
+            or "connection has been closed" in low or "nameresolution" in low):
+        return "Сайт не ответил (проверь доступ или прокси)"
     if "private" in low or "login" in low or "cookie" in low or "sign in" in low:
         return "Нужен доступ к посту (куки)"
     if "429" in low or "too many requests" in low or "rate limit" in low:
@@ -665,14 +700,8 @@ def collect_thumbs(entry: dict[str, Any]) -> list[str]:
     return dedupe([u for _, u in found if u.startswith("http")])
 
 
-def inspect_media(url: str, quality: str, cfg: Config) -> dict[str, Any]:
-    """Разведка (в потоке). Не качает, но показывает состав поста."""
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts(cfg, quality, download=False)) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as exc:
-        log.warning("разведка не удалась (%s): %s: %s", url[:90], type(exc).__name__, exc)
-        return {"kind": "error", "error": friendly_error(exc), "images": [], "has_video": False}
+def build_inspection(info: Any, cfg: Config) -> dict[str, Any]:
+    """Общий разбор info-словаря и для библиотечного, и для CLI-режима."""
     if not isinstance(info, dict):
         return {"kind": "error", "error": "Пустой ответ", "images": [], "has_video": False}
 
@@ -716,6 +745,79 @@ def inspect_media(url: str, quality: str, cfg: Config) -> dict[str, Any]:
         "duration": duration, "many": len(entries) > 1,
         "error": "" if kind != "error" else "Не нашёл медиа по ссылке",
     }
+
+
+def inspect_error(msg: str) -> dict[str, Any]:
+    return {"kind": "error", "error": msg, "images": [], "has_video": False,
+            "audio_only": False, "title": "", "meta": "", "duration": None, "many": False}
+
+
+def inspect_media(url: str, quality: str, cfg: Config) -> dict[str, Any]:
+    """Fallback: разведка в потоке (YTDLP_ISOLATE_INSPECT=0)."""
+    log.info("разведка: поток, старт %s", url[:90])
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts(cfg, quality, download=False)) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except BaseException as exc:      # SystemExit из экстрактора не должен ронять бота
+        log.warning("разведка не удалась (%s): %s: %s", url[:90], type(exc).__name__, exc)
+        return inspect_error(friendly_error(exc))
+    return build_inspection(info, cfg)
+
+
+def ydl_cli_cmd(url: str, cfg: Config) -> list[str]:
+    """Команда для изолированной разведки: -J = simulate + один JSON."""
+    cmd = [sys.executable, "-m", "yt_dlp", "-J", "--no-warnings", "--no-progress",
+           "--no-color", "--ignore-no-formats-error", "--skip-download",
+           "--playlist-end", str(cfg.max_slides), "--socket-timeout", "15", "--retries", "1"]
+    if cfg.cookies_file and Path(cfg.cookies_file).is_file():
+        cmd += ["--cookies", cfg.cookies_file]
+    if cfg.proxy:
+        cmd += ["--proxy", cfg.proxy]
+    if cfg.ytdlp_cli_extra:
+        try:
+            cmd += shlex.split(cfg.ytdlp_cli_extra)
+        except ValueError:
+            log.warning("YTDLP_CLI_EXTRA: невалидная строка, игнорирую")
+    cmd.append(url)
+    return cmd
+
+
+def inspect_media_cli(url: str, quality: str, cfg: Config) -> dict[str, Any]:
+    """Разведка в ОТДЕЛЬНОМ ПРОЦЕССЕ.
+
+    asyncio.to_thread + wait_for не убивает зависший поток: после рестарта
+    бот получал те же pending-апдейты и уходил в тот же тупик. subprocess.run
+    с timeout гарантированно kill'ит дочерний yt-dlp, а segfault/OOM внутри
+    него больше не валит сам бот.
+    """
+    cmd = ydl_cli_cmd(url, cfg)
+    started = time.monotonic()
+    log.info("разведка: subprocess старт, timeout=%d с, url=%s", cfg.inspect_timeout, url[:90])
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           timeout=cfg.inspect_timeout, check=False, env=env)
+    except subprocess.TimeoutExpired:
+        log.warning("разведка: subprocess ТАЙМАУТ %d с — процесс убит", cfg.inspect_timeout)
+        return inspect_error("Таймаут разведки, попробуй ещё раз")
+    except BaseException as exc:
+        log.warning("разведка: subprocess не запустился: %s: %s", type(exc).__name__, exc)
+        return inspect_error(friendly_error(exc))
+
+    err = (r.stderr or "").strip()
+    log.info("разведка: subprocess rc=%d за %.1f с, stdout=%d Б, stderr=%r",
+             r.returncode, time.monotonic() - started,
+             len(r.stdout or ""), err[-160:])
+    # yt-dlp с -J может вернуть rc=0 и напечатать "null" при фатальной ошибке
+    if r.returncode != 0 or "ERROR:" in err or (r.stdout or "").strip() in ("", "null"):
+        detail = next((ln for ln in err.splitlines() if "ERROR:" in ln), err[-200:] or "Пустой ответ")
+        return inspect_error(friendly_error(Exception(detail.replace("ERROR: ", "", 1))))
+    try:
+        info = json.loads(r.stdout)
+    except (ValueError, TypeError) as exc:
+        log.warning("разведка: невалидный JSON: %s", exc)
+        return inspect_error("Не прочитал ответ экстрактора")
+    return build_inspection(info, cfg)
 
 
 def _dedupe_images(urls: list[str]) -> list[str]:
@@ -802,9 +904,15 @@ async def inspect_plan(svc: "Service", url: str, quality: str) -> dict[str, Any]
     host = (urllib.parse.urlparse(url).hostname or "").lower()
     if IMAGE_URL_RE.search(url):
         return {"kind": "single", "images": [url], "title": "Изображение", "meta": source_label(url)}
-    meta = await asyncio.wait_for(
-        asyncio.to_thread(inspect_media, url, quality, svc.cfg), timeout=svc.cfg.inspect_timeout
-    )
+    inspector = inspect_media_cli if svc.cfg.isolate_inspect else inspect_media
+    try:
+        meta = await asyncio.wait_for(
+            asyncio.to_thread(inspector, url, quality, svc.cfg),
+            timeout=svc.cfg.inspect_timeout + 10,
+        )
+    except asyncio.TimeoutError:
+        log.warning("план: разведка зависла дольше %d с: url=%s", svc.cfg.inspect_timeout, url[:100])
+        meta = inspect_error("Таймаут разведки, попробуй ещё раз")
     log.info("план: host=%s kind=%s video=%s audio=%s err=%r", host or "?",
              meta.get("kind"), meta.get("has_video"), meta.get("audio_only"), meta.get("error"))
     images = list(meta.get("images") or [])
@@ -1030,6 +1138,8 @@ def media_key(url: str, quality: str) -> str:
 @dataclass
 class Job:
     widget_id: int
+    url: str = ""
+    quality: str = ""
     cancel: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task | None = None
     percent: int = 0
@@ -1050,6 +1160,7 @@ class Service:
         self.pending_lock = asyncio.Lock()
         self.rate: dict[int, deque[float]] = defaultdict(deque)
         self.http: ClientSession | None = None
+        self.started_at: float = time.time()
         cfg.tmp_dir.mkdir(parents=True, exist_ok=True)
         write_placeholder_png(placeholder)
 
@@ -1412,6 +1523,14 @@ async def run_job(svc: Service, s: Session, url: str, quality: str, job: Job) ->
         log.warning("job ТАЙМАУТ за %.1f с: chat=%s url=%s",
                     time.monotonic() - started, s.chat_id, url[:100])
         await push_state(svc, s, {"ph": "error", "p": 0, "e": "Таймаут, попробуй ещё раз"})
+    except (SystemExit, KeyboardInterrupt) as exc:
+        # yt-dlp в to_thread теоретически может бросить SystemExit; asyncio.Task
+        # пробрасывает его в event loop и роняет ВЕСЬ процесс — гасим здесь
+        log.error("job прерван системным исключением %s: %r", type(exc).__name__, exc)
+        try:
+            await push_state(svc, s, {"ph": "error", "p": 0, "e": "Скачка прервана, попробуй ещё раз"})
+        except Exception:
+            pass
     except Exception as exc:
         log.exception("job failed за %.1f с: %s: %s",
                       time.monotonic() - started, type(exc).__name__, exc)
@@ -1422,7 +1541,9 @@ async def run_job(svc: Service, s: Session, url: str, quality: str, job: Job) ->
         reporter.cancel()
         async with svc.pending_lock:
             svc.pending = max(0, svc.pending - 1)
-        svc.jobs.pop((s.chat_id, s.widget_id), None)
+        key = (s.chat_id, s.widget_id)
+        if svc.jobs.get(key) is job:      # не удаляем задачу-преемника
+            svc.jobs.pop(key, None)
         try:
             await asyncio.to_thread(cleanup_old, svc)
         except (asyncio.CancelledError, Exception):
@@ -1435,6 +1556,11 @@ async def start_job(svc: Service, s: Session, url: str, quality: str) -> None:
     key = (s.chat_id, s.widget_id)
     old = svc.jobs.get(key)
     if old and not old.done:
+        if old.url == url and old.quality == quality:
+            # рестарт с drop_pending_updates=False присылал один и тот же апдейт
+            # дважды: две разведки -> две сети -> ручной рестарт по кругу
+            log.info("дубль ссылки, пропускаю: chat=%s url=%s", s.chat_id, url[:100])
+            return
         old.cancel.set()
         if old.task:
             old.task.cancel()
@@ -1448,7 +1574,7 @@ async def start_job(svc: Service, s: Session, url: str, quality: str) -> None:
         "ph": "queued", "p": 0, "e": "", "s": source_label(url), "t": "Разбираю ссылку…",
         "m": "", "n": 0, "i": 0, "q": quality, "u": original_link(url),
     })
-    job = Job(widget_id=s.widget_id)
+    job = Job(widget_id=s.widget_id, url=url, quality=quality)
     job.task = asyncio.create_task(run_job(svc, s, url, quality, job))
     svc.jobs[key] = job
     log.info("job поставлен: chat=%s q=%s url=%s", s.chat_id, quality, url[:100])
@@ -1517,6 +1643,9 @@ async def on_text(message: Message, bot: Bot, svc: Service) -> None:
     text = (message.text or "").strip()
     if text.startswith("/"):
         return
+    if message.date and message.date.timestamp() < svc.started_at - 5:
+        log.info("пропускаю устаревший update: chat=%s date=%s", message.chat.id, message.date)
+        return
     url = extract_url(text)
     if not url:
         log.info("сообщение без http(s)-ссылки: chat=%s text=%r",
@@ -1525,6 +1654,8 @@ async def on_text(message: Message, bot: Bot, svc: Service) -> None:
         await push_state(svc, s, {"ph": "idle", "e": "Нужна ссылка http(s)"})
         return
     ok, why = await validate_url(url)
+    if ok:
+        url = normalize_url(url)
     s = await ensure_card(svc, message.chat.id)
     if not ok:
         log.info("ссылка отклонена: chat=%s url=%s причина=%s", message.chat.id, url[:100], why)
@@ -1624,6 +1755,8 @@ def environment_lines(cfg: Config) -> list[str]:
         f"gallery-dl: {shutil.which('gallery-dl') or 'НЕ НАЙДЕН (опционально)'}",
         f"API: {'TEST SERVER' if cfg.test_server else 'production'} · виджеты: {cfg.widget_mode}",
         f"ретрай виджета: {cfg.widget_retry_min} мин · BOT_TOKEN: {'задан' if cfg.token else 'НЕ ЗАДАН'}",
+        f"разведка: {'subprocess (изолировано)' if cfg.isolate_inspect else 'поток'} · "
+        f"drop_pending_updates={int(cfg.drop_pending_updates)} · faulthandler={cfg.faulthandler_interval} с",
     ]
 
 
@@ -1644,6 +1777,13 @@ async def diag_lines(svc: Service, bot: Bot) -> list[str]:
     lines = environment_lines(svc.cfg)
     lines.append(f"очередь: {svc.pending}/{svc.cfg.max_queue} · слотов: {svc.cfg.max_parallel}")
     lines.append(f"сессий в БД: {len(svc.store.sessions)} · активных job: {len(svc.jobs)}")
+    try:
+        import resource
+        import threading
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+        lines.append(f"память maxRSS: {rss} МБ · потоков: {threading.active_count()}")
+    except Exception:
+        pass
     lines += await asyncio.to_thread(_dns_lines_sync)
     try:
         me = await asyncio.wait_for(bot.get_me(), timeout=10)
@@ -1668,6 +1808,33 @@ def selfcheck() -> int:
     return 0
 
 
+def install_signal_diagnostics(cfg: Config) -> None:
+    """Понять, КТО остановил процесс: хост, OOM-killer или зависший поток."""
+    import signal
+    import threading
+    if cfg.faulthandler_interval > 0:
+        try:
+            import faulthandler
+            faulthandler.enable()
+            faulthandler.dump_traceback_later(cfg.faulthandler_interval, repeat=True)
+            log.info("faulthandler: дамп стеков каждые %d с", cfg.faulthandler_interval)
+        except Exception as exc:
+            log.warning("faulthandler: %s", exc)
+
+    def on_term(signum: int, frame: Any) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        log.warning("получен сигнал %s — процесс останавливают извне; "
+                    "потоков=%d, активных job проверь в /diag", name, threading.active_count())
+
+    try:
+        signal.signal(signal.SIGTERM, on_term)   # SIGINT оставляем Python (Ctrl-C)
+    except (ValueError, OSError) as exc:
+        log.warning("не поставил обработчик SIGTERM: %s", exc)
+
+
 async def main() -> None:
     load_dotenv()
     cfg = Config.from_env()
@@ -1679,6 +1846,7 @@ async def main() -> None:
         raise SystemExit(doctor())
     if not cfg.token:
         raise SystemExit("Задай BOT_TOKEN в .env / окружении. Проверка без токена: python bot.py --check")
+    install_signal_diagnostics(cfg)
     widget_html = load_widget_html()
     raw, packed = validate_widget_html(widget_html)
     log.info("widget.html: %s Б raw / %s Б zlib-9", raw, packed)
@@ -1728,10 +1896,11 @@ async def main() -> None:
             await asyncio.Event().wait()
         else:
             try:
-                await bot.delete_webhook(drop_pending_updates=False)
+                await bot.delete_webhook(drop_pending_updates=cfg.drop_pending_updates)
             except TelegramAPIError:
                 pass
-            log.info("polling, allowed_updates=%s", ALLOWED_UPDATES)
+            log.info("polling, allowed_updates=%s, drop_pending_updates=%s",
+                     ALLOWED_UPDATES, cfg.drop_pending_updates)
             await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES)
     finally:
         await svc.close()
