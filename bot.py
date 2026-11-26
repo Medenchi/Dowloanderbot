@@ -120,6 +120,15 @@ def detect_memory_limit_bytes() -> int | None:
     return None
 
 
+def gallery_dl_bin() -> str | None:
+    """pip кладёт консольный скрипт в .venv/bin, который часто не в PATH."""
+    found = shutil.which("gallery-dl")
+    if found:
+        return found
+    cand = Path(sys.executable).with_name("gallery-dl")
+    return str(cand) if cand.is_file() else None
+
+
 def current_rss_mb() -> int:
     try:
         for line in Path("/proc/self/status").read_text().splitlines():
@@ -373,6 +382,10 @@ class Config:
         return shutil.which("ffprobe")
 
     @property
+    def gallery_dl(self) -> str | None:
+        return gallery_dl_bin()
+
+    @property
     def widget_retry_seconds(self) -> int:
         return self.widget_retry_min * 60
 
@@ -406,9 +419,12 @@ def dedupe(items: list[str]) -> list[str]:
     return out
 
 
+FALLBACK_ONLY_KEYS = {"d", "h", "b", "low"}   # тех. детали только в текстовом фолбэке
+
+
 def compact_state(state: dict[str, Any]) -> str:
     """chat_data <= 1024 UTF-8 байт. Резерв: сначала режем/выкидываем второстепенное."""
-    d = dict(state)
+    d = {k: v for k, v in state.items() if k not in FALLBACK_ONLY_KEYS}
     for key, limit in (("t", 64), ("m", 70), ("e", 90), ("u", 300), ("s", 22)):
         if isinstance(d.get(key), str):
             d[key] = d[key][:limit]
@@ -594,7 +610,37 @@ def friendly_error(exc: BaseException) -> str:
 
 
 class FriendlyError(Exception):
-    pass
+    def __init__(self, message: str, detail: str = ""):
+        super().__init__(message)
+        self.detail = detail
+
+
+def hint_for(reason: str) -> str:
+    low = (reason or "").lower()
+    if "памят" in low:
+        return "Поставь MEMORY_PROFILE=low или дай хосту 512 МБ"
+    if "сайт не ответил" in low or "таймаут" in low:
+        return "Проверь доступ к площадке, HTTPS_PROXY или COOKIES_FILE"
+    if "куки" in low or "доступ" in low:
+        return "Нужен COOKIES_FILE с cookies.txt из браузера"
+    if "формат" in low or "ffmpeg" in low:
+        return "Выбери другое качество кнопкой ниже или поставь ffmpeg"
+    if "ссылка не поддерживается" in low:
+        return "Проверь, что ссылка полная и начинается с https://"
+    if "50 мб" in low or "больш" in low:
+        return "Выбери 360p или открой источник кнопкой"
+    return "Попробуй «Ещё раз», другое качество или /diag"
+
+
+def error_patch(exc: BaseException, detail: str = "") -> dict[str, Any]:
+    raw = getattr(exc, "detail", "") or str(exc) or type(exc).__name__
+    full = (raw + (f" · {detail}" if detail else ""))[:220]
+    return {
+        "ph": "error", "p": 0,
+        "e": friendly_error(exc),
+        "d": full,
+        "h": hint_for(friendly_error(exc)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +659,7 @@ class Session:
     slides: list[dict[str, Any]] = field(default_factory=list)
     idx: int = 0
     fallback_at: float = 0.0        # НЕ обновляется push_state: TTL отказа виджета
+    retired: bool = False            # карточку заменили новой — старый job молчит
     updated: float = field(default_factory=time.time)
     last_push: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
@@ -817,9 +864,10 @@ def build_inspection(info: Any, cfg: Config) -> dict[str, Any]:
     }
 
 
-def inspect_error(msg: str) -> dict[str, Any]:
-    return {"kind": "error", "error": msg, "images": [], "has_video": False,
-            "audio_only": False, "title": "", "meta": "", "duration": None, "many": False}
+def inspect_error(msg: str, detail: str = "") -> dict[str, Any]:
+    return {"kind": "error", "error": msg, "detail": detail[:300], "images": [],
+            "has_video": False, "audio_only": False, "title": "", "meta": "",
+            "duration": None, "many": False}
 
 
 def inspect_media(url: str, quality: str, cfg: Config) -> dict[str, Any]:
@@ -898,7 +946,8 @@ def inspect_media_cli(url: str, quality: str, cfg: Config) -> dict[str, Any]:
     # yt-dlp с -J может вернуть rc=0 и напечатать "null" при фатальной ошибке
     if r.returncode != 0 or "ERROR:" in err or (r.stdout or "").strip() in ("", "null"):
         detail = next((ln for ln in err.splitlines() if "ERROR:" in ln), err[-200:] or "Пустой ответ")
-        return inspect_error(friendly_error(Exception(detail.replace("ERROR: ", "", 1))))
+        clean = detail.replace("ERROR: ", "", 1)
+        return inspect_error(friendly_error(Exception(clean)), clean)
     try:
         info = json.loads(r.stdout)
     except (ValueError, TypeError) as exc:
@@ -970,13 +1019,14 @@ async def tiktok_images(svc: "Service", url: str) -> list[str]:
 
 async def gallery_dl_images(url: str, cfg: Config) -> list[str]:
     """Опциональный второй источник каруселей (TikTok / Instagram / Pinterest)."""
-    if not cfg.use_gallery_dl or cfg.low_memory or not shutil.which("gallery-dl"):
+    exe = cfg.gallery_dl
+    if not cfg.use_gallery_dl or cfg.low_memory or not exe:
         return []
 
     def run() -> list[str]:
         try:
             r = subprocess.run(
-                ["gallery-dl", "-g", "--range", f"1-{cfg.max_slides}", url],
+                [exe, "-g", "--range", f"1-{cfg.max_slides}", url],
                 capture_output=True, text=True, timeout=60,
             )
         except Exception:
@@ -1023,7 +1073,7 @@ async def inspect_plan(svc: "Service", url: str, quality: str) -> dict[str, Any]
         return {"kind": "audio", "images": [], "title": meta.get("title", "Аудио"), "meta": meta.get("meta", "")}
     reason = meta.get("error") or "Не нашёл медиа по ссылке"
     log.warning("план: медиа не найдено (%s) url=%s", reason, url[:100])
-    raise FriendlyError(reason)
+    raise FriendlyError(reason, meta.get("detail") or "")
 
 
 def download_media(url: str, quality: str, cfg: Config, job: "Job", chat_id: int, wid: int,
@@ -1257,7 +1307,7 @@ class Service:
         self.http = ClientSession(
             headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
             timeout=ClientTimeout(total=40),
-            connector=TCPConnector(limit=4 if cfg.low_memory else 8, ttl_dns_cache=300),
+            connector=TCPConnector(limit=4 if self.cfg.low_memory else 8, ttl_dns_cache=300),
         )
 
     async def close(self) -> None:
@@ -1276,39 +1326,97 @@ class Service:
         return True
 
 
+PHASES = (("meta", "Разбор"), ("down", "Скачка"), ("encode", "Обработка"), ("up", "Отправка"))
+PHASE_INDEX = {"idle": -1, "queued": 0, "meta": 0, "down": 1, "encode": 2,
+               "up": 3, "done": 4, "carousel": 4, "error": -2}
+PHASE_TITLE = {"idle": "Готов к работе", "queued": "В очереди", "meta": "Разбираю ссылку",
+               "down": "Скачиваю", "encode": "Обрабатываю", "up": "Отправляю в чат",
+               "done": "Готово", "carousel": "Карусель", "error": "Не получилось"}
+HELP_TEXT = ("YouTube, TikTok, Instagram/Reels, X, VK, Reddit, Twitch, Pinterest, "
+             "Rutube, SoundCloud, Likee и всё, что умеет yt-dlp. Просто пришли ссылку.")
+
+
+def progress_bar(p: int, width: int = 18) -> str:
+    p = max(0, min(100, int(p or 0)))
+    filled = round(p * width / 100)
+    return "█" * filled + "░" * (width - filled)
+
+
 def render_fallback(st: dict[str, Any]) -> str:
-    labels = {"idle": "Готов", "queued": "В очереди", "meta": "Разбираю ссылку",
-              "down": f"Скачиваю {st.get('p', 0)}%", "encode": "Обрабатываю", "up": "Отправляю",
-              "done": "Готово", "carousel": "Карусель", "error": "Ошибка"}
-    lines = [f"{st.get('s', 'DOWNLOADER')} · {labels.get(st.get('ph'), st.get('ph', ''))}",
-             st.get("t") or "", st.get("m") or ""]
-    if st.get("e"):
-        lines.append("⚠ " + st["e"])
-    if int(st.get("n") or 0) > 1:
-        lines.append(f"Слайд {int(st.get('i') or 0) + 1}/{st['n']}")
-    return "\n".join(x for x in lines if x)[:900]
+    """Полноценная карточка: прогресс, этапы, детали и подсказка. Не «полтора предложения»."""
+    ph = str(st.get("ph", "idle"))
+    p = int(st.get("p") or 0)
+    src = str(st.get("s") or "DOWNLOADER")
+    err = str(st.get("e") or "")
+    if ph == "error":
+        p = 0
+    cur = PHASE_INDEX.get(ph, -1)
+
+    def step(i: int, name: str) -> str:
+        if cur >= 4 or (cur >= 0 and i < cur):
+            return "✓ " + name
+        if i == cur:
+            return "▶ " + name
+        return "· " + name
+
+    lines: list[str] = [
+        f"🎬  {src}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"{'⚠' if ph == 'error' else '▶'}  {PHASE_TITLE.get(ph, ph)}"
+        + (f" · {p}%" if ph not in ("idle", "error", "done", "carousel") else ""),
+        f"[{progress_bar(p)}]  {p}%",
+        "  ".join(step(i, name) for i, (_, name) in enumerate(PHASES)),
+    ]
+    body = [x for x in (str(st.get("t") or ""), str(st.get("m") or "")) if x]
+    if ph == "error" and body and body[-1] == idle_state().get("m"):
+        body[-1] = ("↗ " + str(st.get("u") or ""))[:110] if st.get("u") else ""
+        body = [x for x in body if x]
+    q = str(st.get("q") or "720")
+    meta_line = f"⚙ {q if q != 'a' else 'Аудио'}"
+    if st.get("b"):
+        meta_line += f" · {st['b']}"
+    n = int(st.get("n") or 0)
+    if n > 1:
+        meta_line += f" · слайд {int(st.get('i') or 0) + 1}/{n}"
+    body.append(meta_line)
+    if body:
+        lines += ["──────────────────────"] + body
+    if err:
+        lines += ["──────────────────────", "⚠ " + err]
+        if st.get("d"):
+            lines.append("↳ " + str(st["d"])[:220])
+        lines.append("💡 " + (str(st.get("h") or hint_for(err))))
+    elif ph == "idle":
+        lines += ["──────────────────────", "💡 " + HELP_TEXT]
+    lines += ["──────────────────────",
+              f"yt-dlp {ytdlp_version()} · ffmpeg {'✓' if shutil.which('ffmpeg') else '✗'} · "
+              f"{'LOW' if st.get('low') else 'normal'} · /diag"]
+    return "\n".join(lines)[:1500]
 
 
 def fallback_kb(st: dict[str, Any]) -> InlineKeyboardMarkup:
     q = str(st.get("q", "720"))
-    rows: list[list[InlineKeyboardButton]] = []
-    if st.get("ph") in ("done", "carousel"):
-        rows.append([InlineKeyboardButton(text=("✓ " if q == x else "") + x,
-                                          callback_data=("q:a" if x == "a" else "q:" + x))
-                     for x in ("360", "720", "1080", "a")])
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text=("✓ " if q == x else "") + label,
+                              callback_data="q:" + x)
+         for x, label in (("360", "360p"), ("720", "720p"), ("1080", "1080p"), ("a", "🎵 mp3"))]
+    ]
     if int(st.get("n") or 0) > 1:
         rows.append([
-            InlineKeyboardButton(text="‹", callback_data="p"),
+            InlineKeyboardButton(text="‹ назад", callback_data="p"),
             InlineKeyboardButton(text=f"{int(st.get('i') or 0) + 1}/{st['n']}", callback_data="noop"),
-            InlineKeyboardButton(text="›", callback_data="n"),
+            InlineKeyboardButton(text="вперёд ›", callback_data="n"),
         ])
     rows.append([
-        InlineKeyboardButton(text="Ещё раз", callback_data="r"),
-        InlineKeyboardButton(text="Отмена", callback_data="x"),
+        InlineKeyboardButton(text="🔁 Ещё раз", callback_data="r"),
+        InlineKeyboardButton(text="✕ Отмена", callback_data="x"),
     ])
     link = st.get("u")
+    extra: list[InlineKeyboardButton] = [InlineKeyboardButton(text="❓ Помощь", callback_data="h"),
+                                         InlineKeyboardButton(text="🩺 Диагностика", callback_data="g")]
     if isinstance(link, str) and link.startswith("https://") and len(link) <= 256:
-        rows.append([InlineKeyboardButton(text="Открыть источник", url=link)])
+        extra.append(InlineKeyboardButton(text="↗ Источник", url=link))
+    rows.append(extra)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1334,6 +1442,8 @@ async def _do_push(svc: Service, s: Session, data: str) -> None:
 
 async def push_state(svc: Service, s: Session, patch: dict[str, Any] | None = None,
                      *, force: bool = True) -> None:
+    if getattr(s, "retired", False):
+        return                         # карточку заменили — не плодим дубли
     if patch:
         s.state.update(patch)
     s.state["v"] = (int(s.state.get("v", 0)) + 1) % 1_000_000
@@ -1358,30 +1468,55 @@ async def push_state(svc: Service, s: Session, patch: dict[str, Any] | None = No
     svc.store.save(s)
 
 
-async def ensure_card(svc: Service, chat_id: int) -> Session:
-    """Одна карточка на чат: сверху медиа, снизу виджет (или тихий фолбэк).
+async def ensure_card(svc: Service, chat_id: int, *, fresh: bool = False) -> Session:
+    """Карточка с ответом. В фолбэке по /start и каждой ссылке создаётся НОВОЕ
+    сообщение внизу чата: старое «далеко в начале переписки» больше не
+    редактируется. Старая сессия помечается retired, чтобы её джоб молчал.
 
-    Отказ Telegram НЕ кешируется насовсем: через WIDGET_RETRY_MIN минут бот
-    снова пробует sendWidget (иначе чат навсегда залипает на тексте).
+    Отказ Telegram не кешируется насовсем: проба sendWidget раз в
+    WIDGET_RETRY_MIN минут; между пробами сразу шлём текстовую карточку.
     """
     cfg = svc.cfg
     old = svc.store.latest(chat_id)
+    carry_media: int | None = None
+    carry_fallback_at = 0.0
     if old:
         retry_due = (old.mode == "fallback" and old.fallback_at > 0
                      and time.time() - old.fallback_at > cfg.widget_retry_seconds)
-        if not (cfg.widget_mode == "auto" and retry_due):
+        if fresh and old.mode == "fallback":
+            carry_media, carry_fallback_at = old.media_id, old.fallback_at
+            log.info("новая карточка внизу чата: chat=%s старая=%s", chat_id, old.widget_id)
+            old.retired = True
+            for key, job in list(svc.jobs.items()):
+                if key[0] == chat_id:
+                    job.cancel.set()
+                    if job.task:
+                        job.task.cancel()
+                    svc.jobs.pop(key, None)
+            try:
+                await svc.bot.delete_message(chat_id=chat_id, message_id=old.widget_id)
+            except TelegramAPIError:
+                pass
+            svc.store.drop(old)
+        elif not (cfg.widget_mode == "auto" and retry_due):
             return old
-        log.info("повторная попытка sendWidget: chat=%s (отказ %.0f с назад)",
-                 chat_id, time.time() - old.fallback_at)
-        try:
-            await svc.bot.delete_message(chat_id=chat_id, message_id=old.widget_id)
-        except TelegramAPIError:
-            pass
-        svc.store.drop(old)
+        else:
+            log.info("повторная попытка sendWidget: chat=%s (отказ %.0f с назад)",
+                     chat_id, time.time() - old.fallback_at)
+            try:
+                await svc.bot.delete_message(chat_id=chat_id, message_id=old.widget_id)
+            except TelegramAPIError:
+                pass
+            svc.store.drop(old)
 
     state = idle_state()
+    state["low"] = cfg.low_memory
+    probe = (cfg.widget_mode == "on" or
+             (cfg.widget_mode == "auto" and
+              (carry_fallback_at == 0 or
+               time.time() - carry_fallback_at > cfg.widget_retry_seconds)))
     media = None
-    if cfg.widget_mode != "off":
+    if probe:
         try:
             media = await svc.bot.send_photo(chat_id=chat_id, photo=FSInputFile(svc.placeholder),
                                              disable_notification=True)
@@ -1398,11 +1533,13 @@ async def ensure_card(svc: Service, chat_id: int) -> Session:
             return s
         except (TelegramBadRequest, TelegramAPIError) as exc:
             text = str(exc)
+            carry_fallback_at = time.time()
             if "INPUT_MEDIA_WIDGET_NOT_ALLOWED" in text.upper():
                 log.warning(
                     "Telegram отказал в виджете: INPUT_MEDIA_WIDGET_NOT_ALLOWED. "
                     "С 13.11.2026 обычным ботам в проде виджеты закрыты (tdlib/telegram-bot-api#947). "
-                    "Ретрай через %d мин; полный UI — TELEGRAM_TEST_SERVER=1.", cfg.widget_retry_min)
+                    "Следующая проба через %d мин; полный UI — TELEGRAM_TEST_SERVER=1.",
+                    cfg.widget_retry_min)
             else:
                 log.warning("sendWidget не удался (%s): %s", type(exc).__name__, text)
             if media is not None:
@@ -1411,12 +1548,15 @@ async def ensure_card(svc: Service, chat_id: int) -> Session:
                 except TelegramAPIError:
                     pass
     else:
-        log.info("TELEGRAM_WIDGETS=off: сразу фолбэк")
+        log.info("виджет не пробуем: throttle %d мин / TELEGRAM_WIDGETS=%s",
+                 cfg.widget_retry_min, cfg.widget_mode)
     msg = await svc.bot.send_message(chat_id=chat_id, text=render_fallback(state),
                                      reply_markup=fallback_kb(state))
-    s = Session(chat_id=chat_id, widget_id=msg.message_id, media_id=None,
-                mode="fallback", state=state, fallback_at=time.time())
+    s = Session(chat_id=chat_id, widget_id=msg.message_id, media_id=carry_media,
+                mode="fallback", state=state,
+                fallback_at=carry_fallback_at or time.time())
     svc.store.save(s)
+    log.info("карточка: chat=%s msg=%s mode=fallback", chat_id, msg.message_id)
     return s
 
 
@@ -1479,6 +1619,8 @@ async def deliver_media(svc: Service, s: Session, path: Path, dest: Path, qualit
                 "e": ("Мало памяти для пережатия — открой источник кнопкой ниже"
                       if svc.cfg.low_memory else
                       "Файл больше 50 МБ — открой источник кнопкой ниже"),
+                "d": f"размер {size // (1024 * 1024)} МБ > лимита загрузки 50 МБ",
+                "h": "Выбери 360p или открой источник кнопкой",
                 "u": original_link(s.url),
             })
             shutil.rmtree(dest, ignore_errors=True)
@@ -1607,26 +1749,28 @@ async def run_job(svc: Service, s: Session, url: str, quality: str, job: Job) ->
     except asyncio.CancelledError:
         log.info("job отменён: chat=%s", s.chat_id)
         try:
-            await push_state(svc, s, {"ph": "idle", "p": 0, "e": "", "t": "Отправь ссылку"})
+            await push_state(svc, s, {"ph": "idle", "p": 0, "e": "", "d": "", "h": "", "b": "",
+                                      "t": "Отправь ссылку"})
         except (asyncio.CancelledError, Exception):
             pass
     except asyncio.TimeoutError:
         log.warning("job ТАЙМАУТ за %.1f с: chat=%s url=%s",
                     time.monotonic() - started, s.chat_id, url[:100])
-        await push_state(svc, s, {"ph": "error", "p": 0, "e": "Таймаут, попробуй ещё раз"})
+        await push_state(svc, s, error_patch(Exception(
+            f"Таймаут {svc.cfg.inspect_timeout} с: разведка или скачка не ответила")))
     except (SystemExit, KeyboardInterrupt) as exc:
         # yt-dlp в to_thread теоретически может бросить SystemExit; asyncio.Task
         # пробрасывает его в event loop и роняет ВЕСЬ процесс — гасим здесь
         log.error("job прерван системным исключением %s: %r", type(exc).__name__, exc)
         try:
-            await push_state(svc, s, {"ph": "error", "p": 0, "e": "Скачка прервана, попробуй ещё раз"})
+            await push_state(svc, s, error_patch(exc))
         except Exception:
             pass
     except Exception as exc:
         log.exception("job failed за %.1f с: %s: %s",
                       time.monotonic() - started, type(exc).__name__, exc)
         if "Отменено" not in str(exc):
-            await push_state(svc, s, {"ph": "error", "p": 0, "e": friendly_error(exc)})
+            await push_state(svc, s, error_patch(exc))
     finally:
         job.done = True
         reporter.cancel()
@@ -1685,6 +1829,14 @@ async def handle_command(svc: Service, s: Session, cmd: str) -> None:
         except Exception as exc:
             await push_state(svc, s, {"ph": "error", "e": friendly_error(exc)})
         return
+    if cmd == "h":
+        await push_state(svc, s, {"h": HELP_TEXT})
+        return
+    if cmd == "g":
+        lines = await diag_lines(svc, svc.bot)
+        await svc.bot.send_message(chat_id=s.chat_id, text="\n".join(lines)[:3800],
+                                   disable_notification=True)
+        return
     if cmd == "x":
         job = svc.jobs.get((s.chat_id, s.widget_id))
         if job:
@@ -1705,6 +1857,10 @@ async def handle_command(svc: Service, s: Session, cmd: str) -> None:
             return                     # не перекачиваем то же самое
         if s.url:
             await start_job(svc, s, s.url, q)
+        else:
+            # качество можно выбрать заранее, до первой ссылки
+            s.quality = q
+            await push_state(svc, s, {"q": q, "h": "Теперь пришли ссылку — скачаю в этом качестве"})
 
 
 # ---------------------------------------------------------------------------
@@ -1716,9 +1872,10 @@ router = Router()
 
 @router.message(CommandStart())
 async def on_start(message: Message, bot: Bot, svc: Service) -> None:
-    s = await ensure_card(svc, message.chat.id)
-    await push_state(svc, s, {"ph": "idle", "p": 0, "e": "", "t": "Отправь ссылку",
-                              "n": 0, "i": 0, "m": "YouTube · TikTok · Instagram · X · VK · и другие"})
+    s = await ensure_card(svc, message.chat.id, fresh=True)
+    await push_state(svc, s, {"ph": "idle", "p": 0, "e": "", "d": "", "h": "", "b": "",
+                              "t": "Отправь ссылку", "n": 0, "i": 0, "low": svc.cfg.low_memory,
+                              "m": "Покажу прогресс, результат и детали прямо здесь"})
 
 
 @router.message(Command("diag"))
@@ -1741,20 +1898,22 @@ async def on_text(message: Message, bot: Bot, svc: Service) -> None:
     if not url:
         log.info("сообщение без http(s)-ссылки: chat=%s text=%r",
                  message.chat.id, text[:60])
-        s = await ensure_card(svc, message.chat.id)
-        await push_state(svc, s, {"ph": "idle", "e": "Нужна ссылка http(s)"})
+        s = await ensure_card(svc, message.chat.id, fresh=True)
+        await push_state(svc, s, {"ph": "idle", "e": "Нужна ссылка http(s)",
+                                  "d": f"получено: {text[:120]!r}", "h": HELP_TEXT})
         return
     ok, why = await validate_url(url)
     if ok:
         url = normalize_url(url)
-    s = await ensure_card(svc, message.chat.id)
+    s = await ensure_card(svc, message.chat.id, fresh=True)
     if not ok:
         log.info("ссылка отклонена: chat=%s url=%s причина=%s", message.chat.id, url[:100], why)
-        await push_state(svc, s, {"ph": "error", "e": why})
+        await push_state(svc, s, error_patch(Exception(why), url[:120]))
         return
     if not svc.allow_user(message.chat.id):
         log.info("rate limit: chat=%s (%d ссылок / 30 с)", message.chat.id, svc.cfg.rate_per_30s)
-        await push_state(svc, s, {"ph": "error", "e": "Слишком часто, подожди 30 секунд"})
+        await push_state(svc, s, error_patch(Exception("Слишком часто, подожди 30 секунд"),
+                                             f"лимит {svc.cfg.rate_per_30s} ссылок / 30 с"))
         return
     await start_job(svc, s, url, s.quality or "720")
 
@@ -1843,9 +2002,10 @@ def environment_lines(cfg: Config) -> list[str]:
     return [
         f"Python {sys.version.split()[0]} · aiogram {aiogram.__version__} · yt-dlp {ytdlp_version()}",
         f"ffmpeg: {cfg.ffmpeg or 'НЕ НАЙДЕН'} · ffprobe: {cfg.ffprobe or 'НЕ НАЙДЕН'}",
-        f"gallery-dl: {shutil.which('gallery-dl') or 'НЕ НАЙДЕН (опционально)'}",
+        f"gallery-dl: {cfg.gallery_dl or 'НЕ НАЙДЕН (опционально)'}",
         f"API: {'TEST SERVER' if cfg.test_server else 'production'} · виджеты: {cfg.widget_mode}",
-        f"ретрай виджета: {cfg.widget_retry_min} мин · BOT_TOKEN: {'задан' if cfg.token else 'НЕ ЗАДАН'}",
+        f"ретрай виджета: {cfg.widget_retry_min} мин · BOT_TOKEN: "
+        f"{'задан' if cfg.token and 'AAExampleTokenReplaceMe' not in cfg.token else 'НЕ ЗАДАН (пример из .env.example)'}",
         f"разведка: {'subprocess (изолировано)' if cfg.isolate_inspect else 'поток'} · "
         f"drop_pending_updates={int(cfg.drop_pending_updates)} · faulthandler={cfg.faulthandler_interval} с",
         f"память: лимит={cfg.memory_limit_mb} МБ · профиль={'LOW' if cfg.low_memory else 'normal'} "
@@ -1904,7 +2064,7 @@ def selfcheck() -> int:
     import aiogram
     print(f"aiogram {aiogram.__version__} (Bot API 10.5), yt-dlp: {ytdlp_version()}")
     print(f"ffmpeg: {shutil.which('ffmpeg') or 'НЕ НАЙДЕН (без пережатия >50 МБ)'} · "
-          f"gallery-dl: {shutil.which('gallery-dl') or 'НЕ НАЙДЕН (опционально)'}")
+          f"gallery-dl: {gallery_dl_bin() or 'НЕ НАЙДЕН (опционально)'}")
     return 0
 
 

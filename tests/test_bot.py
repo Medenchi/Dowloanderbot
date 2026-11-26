@@ -133,14 +133,15 @@ def test_fallback_keyboard_callback_data_short():
     for row in kb.inline_keyboard:
         for btn in row:
             assert len(btn.callback_data.encode("utf-8")) <= 64
-    assert "‹" in [b.text for b in kb.inline_keyboard[-2]]
+    assert any("‹" in b.text for row in kb.inline_keyboard for b in row)
 
 
 def test_render_fallback_contains_phase():
     st = bot.idle_state()
     st.update({"ph": "error", "e": "Таймаут"})
     txt = bot.render_fallback(st)
-    assert "Ошибка" in txt and "Таймаут" in txt and len(txt) <= 900
+    assert "Не получилось" in txt and "Таймаут" in txt and len(txt) <= 1500
+    assert "█" not in txt or "░" in txt        # прогресс-бар на месте
 
 
 # --- URL ------------------------------------------------------------------
@@ -580,8 +581,9 @@ def test_fallback_kb_has_source_button():
     st = bot.idle_state()
     st["u"] = "https://www.youtube.com/watch?v=abc"
     rows = bot.fallback_kb(st).model_dump()["inline_keyboard"]
-    assert rows[-1][0]["url"].startswith("https://")
-    assert not rows[-1][0].get("callback_data")
+    urls = [b["url"] for row in rows for b in row if b.get("url")]
+    assert any(u.startswith("https://") for u in urls)
+    assert all(not b.get("callback_data") for row in rows for b in row if b.get("url"))
 
 
 def test_download_media_prefers_merged_mp4(tmp_path, cfg, monkeypatch):
@@ -1027,3 +1029,144 @@ def test_friendly_error_oom():
 def test_environment_lines_show_memory(cfg):
     text = " ".join(bot.environment_lines(cfg))
     assert "память:" in text and "профиль=" in text and "RSS=" in text
+
+
+# --- карточка «всегда отвечает» и rich fallback ----------------------------
+
+def test_service_start_has_no_nameerror(tmp_path, cfg):
+    """Регресс из лога: NameError: name 'cfg' is not defined в Service.start."""
+    async def run():
+        svc, fake = fresh_service(tmp_path)
+        await svc.start()
+        assert svc.http is not None
+        assert svc.http.connector.limit == (4 if svc.cfg.low_memory else 8)
+        await svc.close()
+    asyncio.run(run())
+
+
+def test_fresh_card_replaces_old_message(tmp_path, cfg):
+    async def run():
+        svc, fake = fresh_service(tmp_path, widget_fails=True)
+        first = await bot.ensure_card(svc, 777)
+        assert first.mode == "fallback"
+        msgs_before = sum(1 for k, _ in fake.sent if k == "message")
+        second = await bot.ensure_card(svc, 777, fresh=True)
+        assert second is not first and second.mode == "fallback"
+        assert first.retired is True
+        msgs_after = sum(1 for k, _ in fake.sent if k == "message")
+        assert msgs_after == msgs_before + 1
+        assert any(k == "delete" for k, _ in fake.sent)
+        assert len(svc.store.sessions) == 1
+        # старая сессия больше не пушит (не плодит дубли)
+        before = len(fake.state_calls)
+        await bot.push_state(svc, first, {"ph": "error", "e": "призрак"})
+        assert len(fake.state_calls) == before
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_fresh_card_carries_media_id_and_fallback_ttl(tmp_path, cfg):
+    async def run():
+        svc, fake = fresh_service(tmp_path, widget_fails=True)
+        first = await bot.ensure_card(svc, 777)
+        first.media_id = 555
+        first.fallback_at = time.time() - 10
+        svc.store.save(first)
+        second = await bot.ensure_card(svc, 777, fresh=True)
+        assert second.media_id == 555
+        assert abs(second.fallback_at - first.fallback_at) < 0.01
+        assert not any(k == "widget" for k, _ in fake.sent)   # throttle пробы виджета
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_on_start_always_sends_new_card(tmp_path, cfg, monkeypatch):
+    async def run():
+        svc, fake = fresh_service(tmp_path, widget_fails=True)
+        msg = Message(message_id=1, date=datetime.now(timezone.utc),
+                      chat=Chat(id=777, type="private"), text="/start")
+        for _ in range(3):
+            await bot.on_start(msg, fake, svc)
+        assert sum(1 for k, _ in fake.sent if k == "message") == 3
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_render_fallback_progress_and_tech():
+    st = bot.idle_state()
+    st.update({"ph": "down", "p": 42, "s": "YouTube", "t": "Ролик", "q": "720", "b": "12 МБ"})
+    txt = bot.render_fallback(st)
+    assert "█" in txt and "░" in txt and "42%" in txt
+    assert "Скачка" in txt and "12 МБ" in txt and "yt-dlp" in txt
+    assert "720" in txt
+
+
+def test_render_fallback_error_details():
+    st = bot.idle_state()
+    st.update({"ph": "error", "e": "Сайт не ответил (проверь доступ или прокси)",
+               "d": "ERROR: Unable to download webpage: TLS EOF",
+               "h": "Проверь HTTPS_PROXY"})
+    txt = bot.render_fallback(st)
+    assert "⚠" in txt and "↳ ERROR:" in txt and "💡 Проверь HTTPS_PROXY" in txt
+    assert "[░" in txt
+
+
+def test_fallback_kb_quality_always_visible():
+    rows = bot.fallback_kb(bot.idle_state()).inline_keyboard
+    assert [b.callback_data for b in rows[0]] == ["q:360", "q:720", "q:1080", "q:a"]
+    assert any(b.callback_data == "h" for row in rows for b in row)
+    assert any(b.callback_data == "g" for row in rows for b in row)
+
+
+def test_handle_command_help_diag_and_quality(tmp_path, cfg, monkeypatch):
+    async def run():
+        svc, s, fake = make_service(tmp_path, cfg)
+        s.url = ""
+
+        async def fake_diag(service, b):
+            return ["OK"]
+
+        monkeypatch.setattr(bot, "diag_lines", fake_diag)
+        await bot.handle_command(svc, s, "h")
+        assert "YouTube" in s.state["h"]
+        await bot.handle_command(svc, s, "g")
+        assert "OK" in fake.sent[-1][1]["text"]
+        await bot.handle_command(svc, s, "q:360")
+        assert s.quality == "360" and s.state["q"] == "360"
+        svc.store.close()
+
+    asyncio.run(run())
+
+
+def test_error_patch_has_detail_and_hint():
+    p = bot.error_patch(Exception("Unsupported URL"), "https://bad.link")
+    assert p["ph"] == "error" and p["p"] == 0
+    assert p["e"] == "Ссылка не поддерживается"
+    assert "Unsupported URL" in p["d"] and "https://bad.link" in p["d"]
+    assert p["h"]
+
+
+def test_compact_state_excludes_fallback_only_keys():
+    st = bot.idle_state()
+    st.update({"d": "x" * 200, "h": "y" * 200, "b": "99 МБ", "low": True})
+    data = bot.compact_state(st)
+    assert not any(k in json.loads(data) for k in ("d", "h", "b", "low"))
+    assert len(data.encode("utf-8")) <= 1024
+
+
+def test_gallery_dl_bin_finds_venv_script(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot.shutil, "which", lambda name: None)
+    fake_python = tmp_path / "python"
+    monkeypatch.setattr(bot.sys, "executable", str(fake_python))
+    assert bot.gallery_dl_bin() is None
+    (tmp_path / "gallery-dl").write_text("#!/bin/sh\n")
+    assert bot.gallery_dl_bin() == str(tmp_path / "gallery-dl")
+
+
+def test_environment_lines_marks_example_token(cfg):
+    c = replace(cfg, token="123456789:AAExampleTokenReplaceMe")
+    text = " ".join(bot.environment_lines(c))
+    assert "НЕ ЗАДАН (пример" in text
