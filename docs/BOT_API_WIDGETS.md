@@ -191,3 +191,21 @@ await bot.set_webhook(url=..., allowed_updates=[
 - https://core.telegram.org/bots/api#sendwidget · https://core.telegram.org/bots/widgets · https://core.telegram.org/bots/api-changelog
 - https://github.com/TelegramMessenger/widget-sandbox/blob/main/docs/tgw-format.md
 - https://docs.aiogram.dev/en/latest/ · https://github.com/aiogram/aiogram/pull/2087 · https://github.com/aiogram/aiogram/pull/2089
+
+### Фолбэк как основной UI (пока прод закрыт)
+
+`INPUT_MEDIA_WIDGET_NOT_ALLOWED` делает фолбэк не «запасным», а единственным видимым
+интерфейсом. Поэтому:
+
+* `ensure_card(..., fresh=True)` на `/start` и на каждом входящем сообщении создаёт новую
+  карточку внизу чата, удаляет предыдущую, отменяет её job и помечает сессию `retired`
+  (`push_state` у retired-сессий no-op) — иначе отменённая задача пересоздавала бы удалённое
+  сообщение и плодила дубли.
+* Проба `sendWidget` — не чаще раза в `WIDGET_RETRY_MIN` (между пробами сразу текстовая
+  карточка); `fallback_at` переносится в новую сессию, чтобы TTL не сбрасывался каждым `/start`.
+* `render_fallback`: прогресс-бар `█/░`, 4 фазы с ✓/▶, качество/размер/слайд, блок ошибки
+  (`e` причина + `d` сырая деталь + `h` подсказка), тех. строка с версией yt-dlp и профилем
+  памяти. `FALLBACK_ONLY_KEYS` исключает `d/h/b/low` из `compact_state`, сохраняя бюджет
+  `chat_data` ≤1 КБ для виджета.
+* Клавиатура: качество всегда (в т.ч. до первой ссылки), стрелки, повтор/отмена, помощь,
+  `/diag` отчёт кнопкой, `url`-кнопка на источник.
