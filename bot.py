@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html as html_lib
+import importlib.metadata
 import ipaddress
 import json
 import logging
@@ -89,10 +90,44 @@ from aiogram.types import (
     WidgetQuery,
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-import yt_dlp
-from yt_dlp.utils import DownloadError as YTDLDownloadError
 
 log = logging.getLogger("dowloander")
+
+
+def ytdlp_version() -> str:
+    """Версия пакета БЕЗ импорта yt-dlp (он съедает ~13 МБ RSS в родителе)."""
+    try:
+        return importlib.metadata.version("yt-dlp")
+    except Exception:
+        return "?"
+
+
+def detect_memory_limit_bytes() -> int | None:
+    """Реальный лимит контейнера: cgroup важнее, чем MemTotal хоста."""
+    for p in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = Path(p).read_text().strip()
+            if v.isdigit() and 0 < int(v) < (1 << 50):
+                return int(v)
+        except (OSError, ValueError):
+            pass
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def current_rss_mb() -> int:
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
 
 # ---------------------------------------------------------------------------
 # Константы и конфиг
@@ -247,9 +282,32 @@ class Config:
     drop_pending_updates: bool  # не перечитывать старые апдейты после рестарта
     faulthandler_interval: int  # 0 = выкл; дамп стеков, если бот завис
     ytdlp_cli_extra: str        # доп. флаги yt-dlp CLI через shlex
+    memory_profile: str         # auto | low | normal
+    memory_limit_bytes: int | None
+    low_memory: bool
+    ytdlp_max_as_mb: int        # ulimit -v для дочернего yt-dlp, 0 = без лимита
 
     @classmethod
     def from_env(cls) -> "Config":
+        memory_profile = _env_choice("MEMORY_PROFILE", "auto", ("auto", "low", "normal"))
+        limit = detect_memory_limit_bytes()
+        low = (memory_profile == "low" or
+               (memory_profile == "auto" and limit is not None
+                and limit < 384 * 1024 * 1024))
+        raw_max_as = _env_int("YTDLP_MAX_AS_MB", -1)
+        # LOW — жёсткий потолок, даже если в .env скопировали дефолты из .env.example
+        if low:
+            max_parallel = 1
+            max_queue = min(max(1, _env_int("MAX_QUEUE", 8)), 8)
+            max_original_mb = min(_env_int("MAX_ORIGINAL_MB", 150), 150)
+            max_slides = min(max(2, _env_int("MAX_SLIDES", 10)), 10)
+            keep_files_min = min(_env_int("KEEP_FILES_MIN", 10), 10)
+        else:
+            max_parallel = max(1, _env_int("MAX_PARALLEL", 2))
+            max_queue = max(1, _env_int("MAX_QUEUE", 40))
+            max_original_mb = _env_int("MAX_ORIGINAL_MB", 400)
+            max_slides = max(2, min(20, _env_int("MAX_SLIDES", 20)))
+            keep_files_min = _env_int("KEEP_FILES_MIN", 30)
         return cls(
             token=_env("BOT_TOKEN"),
             mode=_env("MODE", "polling").lower(),
@@ -260,16 +318,16 @@ class Config:
             webhook_port=_env_int("WEBHOOK_PORT", 8080),
             db_path=Path(_env("DB_PATH", "state.sqlite3")),
             tmp_dir=Path(_env("TMP_DIR", "tmp")),
-            max_parallel=max(1, _env_int("MAX_PARALLEL", 2)),
-            max_queue=max(1, _env_int("MAX_QUEUE", 40)),
+            max_parallel=max_parallel,
+            max_queue=max_queue,
             max_upload_mb=_env_int("MAX_UPLOAD_MB", 48),
-            max_original_mb=_env_int("MAX_ORIGINAL_MB", 400),
+            max_original_mb=max_original_mb,
             max_image_mb=_env_int("MAX_IMAGE_MB", 9),
-            max_slides=max(2, min(20, _env_int("MAX_SLIDES", 20))),
+            max_slides=max_slides,
             inspect_timeout=_env_int("INSPECT_TIMEOUT", 70),
             download_timeout=_env_int("DOWNLOAD_TIMEOUT", 600),
             encode_timeout=_env_int("ENCODE_TIMEOUT", 600),
-            keep_files_min=_env_int("KEEP_FILES_MIN", 30),
+            keep_files_min=keep_files_min,
             cookies_file=_env("COOKIES_FILE"),
             proxy=_env("HTTPS_PROXY") or _env("HTTP_PROXY"),
             use_gallery_dl=_env_bool("USE_GALLERY_DL", True),
@@ -284,7 +342,15 @@ class Config:
             drop_pending_updates=_env_bool("DROP_PENDING_UPDATES", True),
             faulthandler_interval=max(0, _env_int("FAULTHANDLER_INTERVAL", 0)),
             ytdlp_cli_extra=_env("YTDLP_CLI_EXTRA"),
+            memory_profile=memory_profile,
+            memory_limit_bytes=limit,
+            low_memory=low,
+            ytdlp_max_as_mb=raw_max_as if raw_max_as >= 0 else (128 if low else 0),
         )
+
+    @property
+    def memory_limit_mb(self) -> int:
+        return (self.memory_limit_bytes or 0) // (1024 * 1024)
 
     @property
     def max_upload_bytes(self) -> int:
@@ -509,6 +575,9 @@ def friendly_error(exc: BaseException) -> str:
         return "Нужен доступ к посту (куки)"
     if "429" in low or "too many requests" in low or "rate limit" in low:
         return "Сервис ограничил запросы, попробуй позже"
+    if ("memoryerror" in low or "cannot allocate memory" in low
+            or "killed" in low or "out of memory" in low):
+        return "Мало памяти на сервере, попробуй другое качество"
     if "requested format is not available" in low or "no suitable formats" in low:
         return "Нет подходящего формата, попробуй другое качество"
     if "403" in low or "401" in low or "forbidden" in low:
@@ -655,10 +724,11 @@ def ydl_opts(cfg: Config, quality: str, *, download: bool,
         "playlistend": cfg.max_slides,
         "socket_timeout": 15, "retries": 2, "fragment_retries": 2, "file_access_retries": 2,
         "max_filesize": cfg.max_original_bytes,       # режется в downloader/http.py
-        "concurrent_fragment_downloads": 2,
+        "concurrent_fragment_downloads": 1 if cfg.low_memory else 2,
         "overwrites": True, "restrictfilenames": True,
     }
-    if cfg.ffmpeg:                  # без ffmpeg вообще не просить merge/convert
+    has_merge = bool(cfg.ffmpeg) and not cfg.low_memory
+    if has_merge:                   # без ffmpeg ИЛИ при 256 МБ не просить merge/convert
         o["merge_output_format"] = "mp4"
     if cfg.ytdlp_extractor_args:
         o["extractor_args"] = cfg.ytdlp_extractor_args
@@ -670,11 +740,11 @@ def ydl_opts(cfg: Config, quality: str, *, download: bool,
         return o
     assert dest is not None
     o["outtmpl"] = str(dest / "%(autonumber)05d-%(id)s.%(ext)s")
-    o["format"] = format_selector(quality, bool(cfg.ffmpeg))
+    o["format"] = format_selector(quality, bool(cfg.ffmpeg) and not cfg.low_memory)
 
     def hook(d: dict[str, Any]) -> None:
         if job is not None and job.cancel.is_set():
-            raise YTDLDownloadError("Отменено")
+            raise RuntimeError("Отменено")   # не импортируем yt_dlp.utils в родителе
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             got = d.get("downloaded_bytes") or 0
@@ -755,6 +825,7 @@ def inspect_error(msg: str) -> dict[str, Any]:
 def inspect_media(url: str, quality: str, cfg: Config) -> dict[str, Any]:
     """Fallback: разведка в потоке (YTDLP_ISOLATE_INSPECT=0)."""
     log.info("разведка: поток, старт %s", url[:90])
+    import yt_dlp   # ленивый импорт: только в режиме YTDLP_ISOLATE_INSPECT=0
     try:
         with yt_dlp.YoutubeDL(ydl_opts(cfg, quality, download=False)) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -773,6 +844,8 @@ def ydl_cli_cmd(url: str, cfg: Config) -> list[str]:
         cmd += ["--cookies", cfg.cookies_file]
     if cfg.proxy:
         cmd += ["--proxy", cfg.proxy]
+    if cfg.low_memory:
+        cmd += ["--concurrent-fragments", "1", "--extractor-retries", "0"]
     if cfg.ytdlp_cli_extra:
         try:
             cmd += shlex.split(cfg.ytdlp_cli_extra)
@@ -780,6 +853,18 @@ def ydl_cli_cmd(url: str, cfg: Config) -> list[str]:
             log.warning("YTDLP_CLI_EXTRA: невалидная строка, игнорирую")
     cmd.append(url)
     return cmd
+
+
+def wrap_memory_limit(cmd: list[str], cfg: Config) -> list[str]:
+    """Жёсткий RLIMIT_AS для дочернего yt-dlp через shell, НЕ через preexec_fn
+    (тот небезопасен в многопоточном asyncio-процессе). При превышении падает
+    ребёнок, а не весь бот/контейнер."""
+    mb = cfg.ytdlp_max_as_mb
+    if mb <= 0 or os.name != "posix":
+        return cmd
+    kb = mb * 1024
+    return ["/bin/sh", "-c",
+            f'ulimit -v {kb} 2>/dev/null || true; exec "$@"', "sh", *cmd]
 
 
 def inspect_media_cli(url: str, quality: str, cfg: Config) -> dict[str, Any]:
@@ -790,9 +875,10 @@ def inspect_media_cli(url: str, quality: str, cfg: Config) -> dict[str, Any]:
     с timeout гарантированно kill'ит дочерний yt-dlp, а segfault/OOM внутри
     него больше не валит сам бот.
     """
-    cmd = ydl_cli_cmd(url, cfg)
+    cmd = wrap_memory_limit(ydl_cli_cmd(url, cfg), cfg)
     started = time.monotonic()
-    log.info("разведка: subprocess старт, timeout=%d с, url=%s", cfg.inspect_timeout, url[:90])
+    log.info("разведка: subprocess старт, timeout=%d с, rss=%d МБ, as_limit=%d МБ, url=%s",
+             cfg.inspect_timeout, current_rss_mb(), cfg.ytdlp_max_as_mb, url[:90])
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
@@ -805,9 +891,10 @@ def inspect_media_cli(url: str, quality: str, cfg: Config) -> dict[str, Any]:
         return inspect_error(friendly_error(exc))
 
     err = (r.stderr or "").strip()
-    log.info("разведка: subprocess rc=%d за %.1f с, stdout=%d Б, stderr=%r",
-             r.returncode, time.monotonic() - started,
-             len(r.stdout or ""), err[-160:])
+    log.info("разведка: subprocess rc=%d за %.1f с, stdout=%d Б, parent rss=%d МБ, "
+             "as_limit=%d МБ, stderr=%r",
+             r.returncode, time.monotonic() - started, len(r.stdout or ""),
+             current_rss_mb(), cfg.ytdlp_max_as_mb, err[-160:])
     # yt-dlp с -J может вернуть rc=0 и напечатать "null" при фатальной ошибке
     if r.returncode != 0 or "ERROR:" in err or (r.stdout or "").strip() in ("", "null"):
         detail = next((ln for ln in err.splitlines() if "ERROR:" in ln), err[-200:] or "Пустой ответ")
@@ -883,7 +970,7 @@ async def tiktok_images(svc: "Service", url: str) -> list[str]:
 
 async def gallery_dl_images(url: str, cfg: Config) -> list[str]:
     """Опциональный второй источник каруселей (TikTok / Instagram / Pinterest)."""
-    if not cfg.use_gallery_dl or not shutil.which("gallery-dl"):
+    if not cfg.use_gallery_dl or cfg.low_memory or not shutil.which("gallery-dl"):
         return []
 
     def run() -> list[str]:
@@ -946,7 +1033,9 @@ def download_media(url: str, quality: str, cfg: Config, job: "Job", chat_id: int
     opts = ydl_opts(cfg, quality, download=True, dest=dest, job=job)
     if single:
         opts["playlist_items"] = "1"
-    log.info("скачка: старт q=%s ffmpeg=%s format=%s", quality, bool(cfg.ffmpeg), opts.get("format"))
+    import yt_dlp   # ленивый импорт: разведка в subprocess не грузит его в родителя
+    log.info("скачка: старт q=%s ffmpeg=%s format=%s rss=%d МБ",
+             quality, bool(cfg.ffmpeg), opts.get("format"), current_rss_mb())
     started = time.monotonic()
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -1031,7 +1120,7 @@ def transcode(path: Path, dest: Path, cfg: Config, quality: str, duration: float
 
     cmd = [
         cfg.ffmpeg, "-y", "-nostdin", "-i", str(path),
-        "-c:v", "libx264", "-preset", "veryfast",
+        "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
         "-b:v", str(video_bitrate), "-maxrate", str(int(video_bitrate * 1.3)),
         "-bufsize", str(video_bitrate * 2),
         "-vf", f"scale=-2:min({height},ih)",
@@ -1052,7 +1141,7 @@ async def fetch_images(svc: "Service", urls: list[str], chat_id: int, wid: int) 
     dest = svc.cfg.tmp_dir / f"c-{chat_id}-{wid}-{int(time.time() * 1000)}"
     dest.mkdir(parents=True, exist_ok=True)
     limit = min(20 * 1024 * 1024, svc.cfg.max_original_bytes)
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(2 if svc.cfg.low_memory else 4)
 
     async def one(i: int, u: str) -> dict[str, Any] | None:
         host = (urllib.parse.urlparse(u).hostname or "").lower()
@@ -1154,7 +1243,7 @@ class Service:
         self.store = store
         self.widget_html = widget_html
         self.placeholder = placeholder
-        self.sem = asyncio.Semaphore(cfg.max_parallel)
+        self.sem = asyncio.Semaphore(1 if cfg.low_memory else cfg.max_parallel)
         self.jobs: dict[tuple[int, int], Job] = {}
         self.pending = 0
         self.pending_lock = asyncio.Lock()
@@ -1168,7 +1257,7 @@ class Service:
         self.http = ClientSession(
             headers={"User-Agent": BROWSER_HEADERS["User-Agent"]},
             timeout=ClientTimeout(total=40),
-            connector=TCPConnector(limit=8, ttl_dns_cache=300),
+            connector=TCPConnector(limit=4 if cfg.low_memory else 8, ttl_dns_cache=300),
         )
 
     async def close(self) -> None:
@@ -1374,7 +1463,7 @@ async def deliver_media(svc: Service, s: Session, path: Path, dest: Path, qualit
     size = path.stat().st_size
     if size > svc.cfg.max_upload_bytes:
         await push_state(svc, s, {"ph": "encode", "p": 90})
-        if svc.cfg.ffmpeg:
+        if svc.cfg.ffmpeg and not svc.cfg.low_memory:
             try:
                 path = await asyncio.wait_for(
                     asyncio.to_thread(transcode, path, dest, svc.cfg, quality, info.get("duration")),
@@ -1387,7 +1476,9 @@ async def deliver_media(svc: Service, s: Session, path: Path, dest: Path, qualit
             # «extreme = link»: не валим бота загрузкой, даём кнопку на источник
             await push_state(svc, s, {
                 "ph": "error", "p": 0,
-                "e": "Файл больше 50 МБ — открой источник кнопкой ниже",
+                "e": ("Мало памяти для пережатия — открой источник кнопкой ниже"
+                      if svc.cfg.low_memory else
+                      "Файл больше 50 МБ — открой источник кнопкой ниже"),
                 "u": original_link(s.url),
             })
             shutil.rmtree(dest, ignore_errors=True)
@@ -1750,13 +1841,15 @@ def _dns_lines_sync(hosts: tuple[str, ...] = ("youtube.com", "www.tiktok.com", "
 
 def environment_lines(cfg: Config) -> list[str]:
     return [
-        f"Python {sys.version.split()[0]} · aiogram {aiogram.__version__} · yt-dlp {yt_dlp.version.__version__}",
+        f"Python {sys.version.split()[0]} · aiogram {aiogram.__version__} · yt-dlp {ytdlp_version()}",
         f"ffmpeg: {cfg.ffmpeg or 'НЕ НАЙДЕН'} · ffprobe: {cfg.ffprobe or 'НЕ НАЙДЕН'}",
         f"gallery-dl: {shutil.which('gallery-dl') or 'НЕ НАЙДЕН (опционально)'}",
         f"API: {'TEST SERVER' if cfg.test_server else 'production'} · виджеты: {cfg.widget_mode}",
         f"ретрай виджета: {cfg.widget_retry_min} мин · BOT_TOKEN: {'задан' if cfg.token else 'НЕ ЗАДАН'}",
         f"разведка: {'subprocess (изолировано)' if cfg.isolate_inspect else 'поток'} · "
         f"drop_pending_updates={int(cfg.drop_pending_updates)} · faulthandler={cfg.faulthandler_interval} с",
+        f"память: лимит={cfg.memory_limit_mb} МБ · профиль={'LOW' if cfg.low_memory else 'normal'} "
+        f"({cfg.memory_profile}) · RSS={current_rss_mb()} МБ · yt-dlp ulimit={cfg.ytdlp_max_as_mb} МБ",
     ]
 
 
@@ -1768,6 +1861,12 @@ def doctor() -> int:
     lines = [f"widget.html: {raw} Б raw / {packed} Б zlib-9 (лимит {MAX_HTML_ZLIB})"]
     lines += environment_lines(cfg)
     lines += _dns_lines_sync()
+    if cfg.low_memory:
+        lines.append("⚠ LOW-MEMORY: parallel=1, пережатие ffmpeg отключено, "
+                     "yt-dlp ограничен ulimit -v, карусели урезаны")
+    elif not Path("/sys/fs/cgroup/memory.max").is_file():
+        lines.append("ℹ cgroup memory.max не читается: лимит взят из MemTotal хоста. "
+                     "Если стенд на 256 МБ — выставь MEMORY_PROFILE=low вручную")
     print("\n".join(lines))
     return 0
 
@@ -1781,7 +1880,8 @@ async def diag_lines(svc: Service, bot: Bot) -> list[str]:
         import resource
         import threading
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
-        lines.append(f"память maxRSS: {rss} МБ · потоков: {threading.active_count()}")
+        lines.append(f"память maxRSS: {rss} МБ · сейчас VmRSS: {current_rss_mb()} МБ · "
+                     f"потоков: {threading.active_count()}")
     except Exception:
         pass
     lines += await asyncio.to_thread(_dns_lines_sync)
@@ -1802,7 +1902,7 @@ def selfcheck() -> int:
     raw, packed = validate_widget_html(load_widget_html())
     print(f"widget.html: {raw} Б raw / {packed} Б zlib-9 (лимит {MAX_HTML_ZLIB}) — OK")
     import aiogram
-    print(f"aiogram {aiogram.__version__} (Bot API 10.5), yt-dlp: {yt_dlp.version.__version__}")
+    print(f"aiogram {aiogram.__version__} (Bot API 10.5), yt-dlp: {ytdlp_version()}")
     print(f"ffmpeg: {shutil.which('ffmpeg') or 'НЕ НАЙДЕН (без пережатия >50 МБ)'} · "
           f"gallery-dl: {shutil.which('gallery-dl') or 'НЕ НАЙДЕН (опционально)'}")
     return 0
@@ -1852,6 +1952,11 @@ async def main() -> None:
     log.info("widget.html: %s Б raw / %s Б zlib-9", raw, packed)
     for line in environment_lines(cfg):
         log.info("старт: %s", line)
+    if cfg.low_memory:
+        log.warning("LOW-MEMORY (лимит %d МБ): parallel=1, ffmpeg-пережатие отключено, "
+                    "yt-dlp ulimit=%d МБ, MAX_ORIGINAL_MB=%d, MAX_SLIDES=%d",
+                    cfg.memory_limit_mb, cfg.ytdlp_max_as_mb,
+                    cfg.max_original_mb, cfg.max_slides)
     if not cfg.ffmpeg:
         log.warning("ffmpeg не найден: слияние дорожек и пережатие >48 МБ недоступны")
 
